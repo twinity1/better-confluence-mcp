@@ -41,27 +41,16 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 
 ## Available Tools
 
-### Local Sync Tools (Primary)
-
 | Tool | Description |
 |------|-------------|
 | `confluence_sync_space` | Sync a Confluence space to local filesystem |
-| `confluence_read_page` | Fetch a single page and save locally |
-| `confluence_push_page_update` | Push local HTML changes back to Confluence |
-
-### Attachment Tools
-
-| Tool | Description |
-|------|-------------|
-| `confluence_download_attachments` | Download all attachments from a page to local storage |
-| `confluence_upload_attachment` | Upload a local file as an attachment to a page |
-
-### Direct API Tools
-
-| Tool | Description |
-|------|-------------|
-| `confluence_search` | Search Confluence content using CQL |
-| `confluence_get_spaces` | List available Confluence spaces |
+| `confluence_read_page` | Read a page (syncs entire space to local filesystem) |
+| `confluence_create_page` | Create a new page |
+| `confluence_push_page_update` | Push changes, rename, or move a page |
+| `confluence_download_attachments` | Download all attachments from a page |
+| `confluence_upload_attachment` | Upload a file as attachment |
+| `confluence_search` | Search Confluence content |
+| `confluence_get_spaces` | List available spaces |
 | `confluence_get_comments` | Get comments for a page |
 | `confluence_add_comment` | Add a comment to a page |
 | `confluence_search_user` | Search Confluence users |
