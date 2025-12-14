@@ -93,8 +93,8 @@ async def auto_sync_spaces_background(confluence_config: ConfluenceConfig) -> No
                 else:
                     cql_query = cql_base
 
-                # Search for pages
-                search_results = fetcher.search(cql_query, limit=500)
+                # Search for ALL pages with pagination
+                search_results = fetcher.search_all(cql_query)
 
                 if not search_results:
                     logger.debug(f"Space {space_key}: no changes since last sync")

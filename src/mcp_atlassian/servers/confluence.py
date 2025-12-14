@@ -171,8 +171,8 @@ async def _sync_space_impl(confluence_fetcher, space_key: str, full_sync: bool) 
 
         logger.info(f"Using CQL: {cql_query}")
 
-        # Search for pages (this returns page IDs and basic info)
-        search_results = confluence_fetcher.search(cql_query, limit=500)
+        # Search for ALL pages with pagination (no limit)
+        search_results = confluence_fetcher.search_all(cql_query)
 
         if not search_results and not existing_metadata:
             return json.dumps(
@@ -552,8 +552,8 @@ async def _read_page_sync_impl(
     else:
         cql_query = cql_base
 
-    # Search for pages in the space
-    search_results = confluence_fetcher.search(cql_query, limit=500)
+    # Search for ALL pages in the space with pagination
+    search_results = confluence_fetcher.search_all(cql_query)
 
     # Process pages
     saved_pages: list[dict] = []

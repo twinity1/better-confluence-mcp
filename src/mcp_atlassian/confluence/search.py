@@ -18,6 +18,81 @@ logger = logging.getLogger("mcp-atlassian")
 class SearchMixin(ConfluenceClient):
     """Mixin for Confluence search operations."""
 
+    # Confluence API max limit per request (Cloud has 250, Server/DC may vary)
+    MAX_CQL_LIMIT = 250
+
+    @handle_atlassian_api_errors("Confluence API")
+    def search_all(
+        self, cql: str, spaces_filter: str | None = None
+    ) -> list[ConfluencePage]:
+        """
+        Search all content using CQL with automatic pagination.
+
+        Fetches ALL matching results by paginating through the API.
+        Use this for sync operations where you need all pages.
+
+        Args:
+            cql: Confluence Query Language string
+            spaces_filter: Optional comma-separated list of space keys to filter by
+
+        Returns:
+            List of all ConfluencePage models matching the query
+        """
+        all_pages: list[ConfluencePage] = []
+        start = 0
+
+        # Apply spaces filter if present
+        cql = self._apply_spaces_filter(cql, spaces_filter)
+
+        while True:
+            logger.debug(f"Fetching pages: start={start}, limit={self.MAX_CQL_LIMIT}")
+            results = self.confluence.cql(cql=cql, start=start, limit=self.MAX_CQL_LIMIT)
+
+            search_result = ConfluenceSearchResult.from_api_response(
+                results,
+                base_url=self.config.url,
+                cql_query=cql,
+                is_cloud=self.config.is_cloud,
+            )
+
+            all_pages.extend(search_result.results)
+
+            # Check if there are more results
+            total_size = results.get("totalSize", 0)
+            fetched = start + len(search_result.results)
+
+            logger.debug(f"Fetched {fetched}/{total_size} pages")
+
+            if fetched >= total_size or len(search_result.results) == 0:
+                break
+
+            start = fetched
+
+        logger.info(f"Total pages fetched: {len(all_pages)}")
+        return all_pages
+
+    def _apply_spaces_filter(
+        self, cql: str, spaces_filter: str | None = None
+    ) -> str:
+        """Apply spaces filter to CQL query."""
+        filter_to_use = spaces_filter or self.config.spaces_filter
+
+        if filter_to_use:
+            spaces = [s.strip() for s in filter_to_use.split(",")]
+            space_query = " OR ".join(
+                [f"space = {quote_cql_identifier_if_needed(space)}" for space in spaces]
+            )
+
+            if cql and space_query:
+                if "space = " not in cql:
+                    cql = f"({cql}) AND ({space_query})"
+            else:
+                cql = space_query
+
+            logger.info(f"Applied spaces filter to query: {cql}")
+
+        return cql
+
     @handle_atlassian_api_errors("Confluence API")
     def search(
         self, cql: str, limit: int = 10, spaces_filter: str | None = None
@@ -27,7 +102,7 @@ class SearchMixin(ConfluenceClient):
 
         Args:
             cql: Confluence Query Language string
-            limit: Maximum number of results to return
+            limit: Maximum number of results to return (max 250 per API limit)
             spaces_filter: Optional comma-separated list of space keys to filter by,
                 overrides config
 
@@ -38,30 +113,12 @@ class SearchMixin(ConfluenceClient):
             MCPAtlassianAuthenticationError: If authentication fails with the
                 Confluence API (401/403)
         """
-        # Use spaces_filter parameter if provided, otherwise fall back to config
-        filter_to_use = spaces_filter or self.config.spaces_filter
+        # Apply spaces filter
+        cql = self._apply_spaces_filter(cql, spaces_filter)
 
-        # Apply spaces filter if present
-        if filter_to_use:
-            # Split spaces filter by commas and handle possible whitespace
-            spaces = [s.strip() for s in filter_to_use.split(",")]
-
-            # Build the space filter query part using proper quoting for each space key
-            space_query = " OR ".join(
-                [f"space = {quote_cql_identifier_if_needed(space)}" for space in spaces]
-            )
-
-            # Add the space filter to existing query with parentheses
-            if cql and space_query:
-                if "space = " not in cql:  # Only add if not already filtering by space
-                    cql = f"({cql}) AND ({space_query})"
-            else:
-                cql = space_query
-
-            logger.info(f"Applied spaces filter to query: {cql}")
-
-        # Execute the CQL search query
-        results = self.confluence.cql(cql=cql, limit=limit)
+        # Execute the CQL search query (API max is 250)
+        effective_limit = min(limit, self.MAX_CQL_LIMIT)
+        results = self.confluence.cql(cql=cql, limit=effective_limit)
 
         # Convert the response to a search result model
         search_result = ConfluenceSearchResult.from_api_response(
