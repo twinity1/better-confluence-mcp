@@ -26,6 +26,7 @@ def _get_space_lock(space_key: str) -> asyncio.Lock:
     return _space_locks[space_key]
 
 from mcp_atlassian.local_storage import (
+    SpaceMetadata,
     check_and_cleanup_moved_page,
     cleanup_deleted_pages,
     ensure_attachments_folder,
@@ -624,14 +625,8 @@ async def create_page(
 ) -> str:
     """Create a new empty page in Confluence.
 
-    Creates a page with the given title and syncs the entire space to make it
-    available locally. Specify either parent_id OR sibling_id to control placement.
-
-    IMPORTANT:
-    - This tool syncs the space after creating the page.
-    - Do NOT call multiple create_page or other sync tools in parallel.
-    - Call them SEQUENTIALLY (one at a time).
-    - Sync can take up to 15 minutes for large spaces - be patient.
+    Creates a page with the given title and saves it locally. Specify either
+    parent_id OR sibling_id to control placement.
 
     Args:
         ctx: The FastMCP context.
@@ -709,24 +704,56 @@ async def create_page(
             content_representation="storage",
         )
 
-        # Sync the space to get the new page locally (full sync to ensure new page is included)
-        space_lock = _get_space_lock(space_key)
-        async with space_lock:
-            await _sync_space_impl(confluence_fetcher, space_key, full_sync=True)
+        page_id_str = str(new_page.id)
 
-        # Get the new page info from metadata
-        new_metadata = load_space_metadata(space_key)
-        page_data = new_metadata.page_index.get(new_page.id) if new_metadata else None
+        # Get ancestors for the new page (parent + parent's ancestors)
+        ancestor_ids = []
+        if actual_parent_id:
+            parent_ancestors = confluence_fetcher.get_page_ancestors(actual_parent_id)
+            ancestor_ids = [a.id for a in parent_ancestors] + [actual_parent_id]
+
+        # Save the new page directly to local storage (avoid full sync delay)
+        version_num = new_page.version.number if new_page.version else 1
+        file_path = save_page_html(
+            space_key=space_key,
+            page_id=page_id_str,
+            title=new_page.title,
+            html_content="",  # Empty content for new page
+            version=version_num,
+            url=new_page.url,
+            ancestors=ancestor_ids,
+        )
+
+        # Update metadata with the new page
+        existing_metadata = load_space_metadata(space_key)
+        if not existing_metadata:
+            # Create new metadata if space wasn't synced before
+            existing_metadata = SpaceMetadata(
+                space_key=space_key,
+                space_name=space_key,  # Use key as name placeholder
+                last_synced=datetime.now(timezone.utc).isoformat(),
+                total_pages=0,
+            )
+        existing_metadata.page_index[page_id_str] = {
+            "title": new_page.title,
+            "version": version_num,
+            "url": new_page.url,
+            "path": file_path,
+            "ancestors": ancestor_ids,
+            "last_synced": datetime.now(timezone.utc).isoformat(),
+        }
+        existing_metadata.total_pages = len(existing_metadata.page_index)
+        save_space_metadata(existing_metadata)
 
         result = {
             "success": True,
             "message": f"Page '{title}' created successfully",
-            "page_id": new_page.id,
+            "page_id": page_id_str,
             "title": new_page.title,
             "space_key": space_key,
             "url": new_page.url,
-            "local_path": page_data["path"] if page_data else None,
-            "absolute_path": str(Path.cwd() / page_data["path"]) if page_data else None,
+            "local_path": file_path,
+            "absolute_path": str(Path.cwd() / file_path),
             "parent_id": actual_parent_id,
         }
         return json.dumps(result, indent=2, ensure_ascii=False)
