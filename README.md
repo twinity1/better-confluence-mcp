@@ -32,6 +32,7 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 
 ## Features
 
+- **Fast & token-efficient editing** - Agents make surgical edits to local files instead of regenerating entire pages, saving tokens
 - **Tree-based storage** - Folder structure matches Confluence hierarchy
 - **Incremental sync** - Only fetches pages modified since last sync (using CQL)
 - **Version conflict detection** - Prevents overwriting external edits
@@ -216,6 +217,7 @@ This is a fork of [mcp-atlassian](https://github.com/sooperset/mcp-atlassian) op
 |----------|----------------------|
 | Fetches pages via API on demand | Syncs to local files once |
 | Page content in context window | Files on filesystem |
+| Must regenerate entire page for any change | Surgical edits - fewer tokens burned |
 | Complex tool parameters | Simple read/edit/push workflow |
 | General purpose | Optimized for agents |
 
