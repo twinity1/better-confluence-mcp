@@ -515,3 +515,47 @@ class PagesMixin(ConfluenceClient):
         except Exception as e:
             logger.error(f"Error deleting page {page_id}: {str(e)}")
             raise Exception(f"Failed to delete page {page_id}: {str(e)}") from e
+
+    def move_page(
+        self,
+        page_id: str,
+        target_id: str,
+        position: str = "append",
+    ) -> bool:
+        """
+        Move a page relative to another page.
+
+        Args:
+            page_id: The ID of the page to move
+            target_id: The ID of the target page
+            position: Where to place the page relative to target:
+                - 'before': Place before the target (as sibling)
+                - 'after': Place after the target (as sibling)
+                - 'append': Place as last child of target (default)
+
+        Returns:
+            Boolean indicating success (True) or failure (False)
+
+        Raises:
+            Exception: If there is an error moving the page
+        """
+        try:
+            # Get target page to find its space key
+            target_page = self.confluence.get_page_by_id(target_id, expand="space")
+            space_key = target_page.get("space", {}).get("key")
+            if not space_key:
+                raise Exception(f"Could not determine space key for target page {target_id}")
+
+            logger.debug(f"Moving page {page_id} {position} {target_id} in space {space_key}")
+            self.confluence.move_page(
+                space_key=space_key,
+                page_id=page_id,
+                target_id=target_id,
+                position=position,
+            )
+            logger.info(f"Moved page {page_id} {position} {target_id}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error moving page {page_id}: {str(e)}")
+            raise Exception(f"Failed to move page {page_id}: {str(e)}") from e

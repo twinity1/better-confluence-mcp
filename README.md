@@ -34,10 +34,7 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 
 - **Tree-based storage** - Folder structure matches Confluence hierarchy
 - **Incremental sync** - Only fetches pages modified since last sync (using CQL)
-- **Auto full-sync** - Triggers full sync every 3 days to detect deletions
 - **Version conflict detection** - Prevents overwriting external edits
-- **Title-based filenames** - `Page Title.html` instead of `content.html`
-- **Inline HTML formatting** - Pretty indentation without breaking Confluence
 
 ## Available Tools
 
@@ -46,10 +43,9 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 | `confluence_sync_space` | Sync a Confluence space to local filesystem |
 | `confluence_read_page` | Read a page (syncs entire space to local filesystem) |
 | `confluence_create_page` | Create a new page |
-| `confluence_push_page_update` | Push changes, rename, or move a page |
+| `confluence_push_page_update` | Push changes, rename, move, or reorder a page |
 | `confluence_download_attachments` | Download all attachments from a page |
 | `confluence_upload_attachment` | Upload a file as attachment |
-| `confluence_search` | Search Confluence content |
 | `confluence_get_spaces` | List available spaces |
 | `confluence_get_comments` | Get comments for a page |
 | `confluence_add_comment` | Add a comment to a page |

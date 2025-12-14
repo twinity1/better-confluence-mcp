@@ -75,6 +75,20 @@ async def sync_space(
 ) -> str:
     """Sync a Confluence space to local filesystem.
 
+    ## How This MCP Works
+
+    This MCP is designed around a simple principle: **coding agents work best
+    with files**. Instead of fetching pages via API on every request, this MCP:
+
+    1. **Syncs** Confluence spaces to local HTML files (this tool)
+    2. **Agent edits** files directly using standard file tools (Read, Edit, Write)
+    3. **Pushes** changes back to Confluence via push_page_update
+
+    This approach keeps the context window clean and lets agents use their
+    native file editing capabilities.
+
+    ## Sync Behavior
+
     Downloads pages from the specified space and stores them as formatted HTML
     in a tree structure under .better-confluence-mcp/SPACE_KEY/.
 
@@ -85,11 +99,8 @@ async def sync_space(
     is automatically triggered to detect deleted pages.
 
     The folder structure mirrors the page hierarchy:
-    - .better-confluence-mcp/SPACE_KEY/page_id/content.html
-    - .better-confluence-mcp/SPACE_KEY/page_id/child_page_id/content.html
-
-    After syncing, the agent can read and edit these HTML files directly using
-    standard file tools, then use push_page_update to push changes.
+    - .better-confluence-mcp/SPACE_KEY/page_id/Page Title.html
+    - .better-confluence-mcp/SPACE_KEY/page_id/child_page_id/Child Title.html
 
     IMPORTANT:
     - Do NOT call multiple sync_space or other sync tools in parallel.
@@ -334,10 +345,19 @@ async def read_page(
 ) -> str:
     """Read a Confluence page by syncing its entire space to the local filesystem.
 
-    IMPORTANT: This tool syncs ALL pages from the space containing the requested
-    page to .better-confluence-mcp/<SPACE_KEY>/ in the current working directory.
+    ## How It Works
+
+    1. **Fetches page from Confluence** to determine its space
+    2. **Syncs entire space** to .better-confluence-mcp/<SPACE_KEY>/
+    3. **Returns local path** to the HTML file
+
+    If the page doesn't exist in Confluence but was previously synced locally,
+    it will use the cached space info and still perform a sync.
+
     This ensures the full context of the space is available locally for the agent
-    to browse and edit.
+    to browse and edit related pages using standard file tools.
+
+    ## Sync Behavior
 
     The sync is incremental by default - only pages modified since the last sync
     are downloaded. A full sync is triggered automatically every 3 days.
@@ -734,11 +754,15 @@ async def push_page_update(
     ],
     move_to_parent_id: Annotated[
         str | None,
-        Field(description="Optional: Move page to be a child of this page. Provide either move_to_parent_id OR move_to_sibling_id, not both."),
+        Field(description="Optional: Move page to be a child of this page (appended as last child)."),
     ] = None,
-    move_to_sibling_id: Annotated[
+    before_page_id: Annotated[
         str | None,
-        Field(description="Optional: Move page to be a sibling of this page (under the same parent). Provide either move_to_parent_id OR move_to_sibling_id, not both."),
+        Field(description="Optional: Position page right BEFORE this sibling page."),
+    ] = None,
+    after_page_id: Annotated[
+        str | None,
+        Field(description="Optional: Position page right AFTER this sibling page."),
     ] = None,
 ) -> str:
     """Push local HTML changes to Confluence, optionally moving or renaming the page.
@@ -762,8 +786,14 @@ async def push_page_update(
     Before updating, it verifies the local version matches Confluence. If someone
     else edited the page, the local copy is re-synced and an error is returned.
 
-    Optionally, specify move_to_parent_id or move_to_sibling_id to move the page
-    to a new location in the page hierarchy.
+    ## Moving and Reordering Pages
+
+    Use these optional parameters to move or reorder pages:
+    - `move_to_parent_id`: Move page as a child of another page (appended at end)
+    - `before_page_id`: Position page right before a sibling (also moves to same parent)
+    - `after_page_id`: Position page right after a sibling (also moves to same parent)
+
+    Only provide ONE of these parameters.
 
     IMPORTANT:
     - If moving the page, this tool syncs the space afterward.
@@ -775,39 +805,37 @@ async def push_page_update(
         ctx: The FastMCP context.
         page_id: The ID of the page to update.
         revision_message: Description of the changes (shown in Confluence page history).
-        move_to_parent_id: Optional new parent page ID (moves page as child).
-        move_to_sibling_id: Optional sibling page ID (moves page under same parent).
+        move_to_parent_id: Optional new parent page ID (moves page as last child).
+        before_page_id: Optional page ID to position before (as sibling).
+        after_page_id: Optional page ID to position after (as sibling).
 
     Returns:
         JSON string indicating success or failure.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
-    # Validate move params
-    if move_to_parent_id and move_to_sibling_id:
+    # Validate move params - only one can be provided
+    move_params = [move_to_parent_id, before_page_id, after_page_id]
+    if sum(1 for p in move_params if p is not None) > 1:
         return json.dumps(
-            {"error": "Provide either move_to_parent_id OR move_to_sibling_id, not both"},
+            {"error": "Provide only ONE of: move_to_parent_id, before_page_id, or after_page_id"},
             indent=2,
             ensure_ascii=False,
         )
 
-    # Resolve move target
-    new_parent_id = None
+    # Determine move operation type
+    move_target_id = None
+    move_position = None  # 'append', 'before', 'after'
+
     if move_to_parent_id:
-        new_parent_id = move_to_parent_id
-    elif move_to_sibling_id:
-        # Get sibling's parent to use as our new parent
-        try:
-            ancestors = confluence_fetcher.get_page_ancestors(move_to_sibling_id)
-            if ancestors:
-                new_parent_id = ancestors[-1].id  # Last ancestor is immediate parent
-            # If no ancestors, sibling is root - we'd become root too (parent_id=None)
-        except Exception as e:
-            return json.dumps(
-                {"error": f"Failed to get sibling page info: {str(e)}"},
-                indent=2,
-                ensure_ascii=False,
-            )
+        move_target_id = move_to_parent_id
+        move_position = "append"
+    elif before_page_id:
+        move_target_id = before_page_id
+        move_position = "before"
+    elif after_page_id:
+        move_target_id = after_page_id
+        move_position = "after"
 
     # Find the page in local storage
     page_info = get_page_info(page_id)
@@ -920,10 +948,11 @@ async def push_page_update(
             content = content[end_comment + 3:].lstrip("\n")
 
     try:
-        # Determine if we're moving the page
-        is_moving = new_parent_id is not None or move_to_sibling_id is not None
+        # Determine if we're moving/reordering the page
+        is_moving = move_target_id is not None
 
-        # Update the page in Confluence using storage format (HTML)
+        # Update the page content in Confluence using storage format (HTML)
+        # Note: We don't pass parent_id here anymore - we use move_page() for positioning
         updated_page = confluence_fetcher.update_page(
             page_id=page_id,
             title=page_title,  # Use title from HTML header (enables renaming)
@@ -932,11 +961,17 @@ async def push_page_update(
             version_comment=revision_message,
             is_markdown=False,
             content_representation="storage",
-            parent_id=new_parent_id,  # This moves the page if provided
         )
 
-        # If page was moved, sync the space to update local file structure
-        if is_moving:
+        # If moving/reordering, use move_page to position the page
+        if is_moving and move_target_id and move_position:
+            confluence_fetcher.move_page(
+                page_id=page_id,
+                target_id=move_target_id,
+                position=move_position,
+            )
+
+            # Sync the space to update local file structure
             space_lock = _get_space_lock(space_key)
             async with space_lock:
                 await _sync_space_impl(confluence_fetcher, space_key, full_sync=False)
@@ -948,13 +983,14 @@ async def push_page_update(
 
             result = {
                 "success": True,
-                "message": "Page updated and moved successfully",
+                "message": f"Page updated and positioned ({move_position} {move_target_id})",
                 "page_id": page_id,
                 "title": updated_page.title,
                 "new_version": version_num,
                 "url": updated_page.url,
                 "revision_message": revision_message,
-                "moved_to_parent": new_parent_id,
+                "move_position": move_position,
+                "move_target_id": move_target_id,
                 "local_path": page_data["path"] if page_data else None,
                 "absolute_path": str(Path.cwd() / page_data["path"]) if page_data else None,
             }
@@ -1012,79 +1048,8 @@ async def push_page_update(
 
 
 # =============================================================================
-# TOOLS - Search, Spaces, Comments, Users
+# TOOLS - Spaces, Comments, Users
 # =============================================================================
-
-
-@confluence_mcp.tool(tags={"confluence", "read"})
-async def search(
-    ctx: Context,
-    query: Annotated[
-        str,
-        Field(
-            description="Search query - can be simple text or CQL. Examples: 'project documentation', 'type=page AND space=DEV', 'title~\"Meeting Notes\"'"
-        ),
-    ],
-    limit: Annotated[
-        int,
-        Field(description="Maximum number of results (1-50)", ge=1, le=50, default=10),
-    ] = 10,
-    spaces_filter: Annotated[
-        str | None,
-        Field(
-            description="Comma-separated list of space keys to filter by (e.g., 'DEV,QA')"
-        ),
-    ] = None,
-) -> str:
-    """Search Confluence content using simple terms or CQL.
-
-    Args:
-        ctx: The FastMCP context.
-        query: Search query - can be simple text or a CQL query string.
-        limit: Maximum number of results (1-50).
-        spaces_filter: Optional comma-separated list of space keys to filter by.
-
-    Returns:
-        JSON string with search results.
-    """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-
-    try:
-        # If query doesn't look like CQL, wrap it in a text search
-        if not any(op in query for op in ["=", "~", ">", "<", " AND ", " OR "]):
-            cql_query = f'text ~ "{query}"'
-        else:
-            cql_query = query
-
-        results = confluence_fetcher.search(
-            cql=cql_query,
-            limit=limit,
-            spaces_filter=spaces_filter,
-        )
-
-        pages = []
-        for page in results:
-            pages.append({
-                "id": page.id,
-                "title": page.title,
-                "space_key": page.space.key if page.space else None,
-                "url": page.url,
-                "excerpt": page.content[:200] if page.content else None,
-            })
-
-        return json.dumps(
-            {"success": True, "total": len(pages), "results": pages},
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    except Exception as e:
-        logger.error(f"Search failed: {e}")
-        return json.dumps(
-            {"error": f"Search failed: {str(e)}"},
-            indent=2,
-            ensure_ascii=False,
-        )
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
