@@ -155,110 +155,162 @@ async def _sync_space_impl(confluence_fetcher, space_key: str, full_sync: bool) 
             last_sync_time = existing_metadata.last_synced
             logger.info(f"Incremental sync from: {last_sync_time}")
 
-        # Build CQL query
-        cql_base = f'type=page AND space.key="{space_key}"'
+        saved_pages: list[dict] = []
+        moved_pages: list[str] = []
+        errors: list[str] = []
+        space_name = space_key
+        all_page_ids: set[str] = set()
 
-        if last_sync_time:
-            # Parse ISO format and convert to CQL date format
+        # Use optimized bulk fetch for full sync (much faster!)
+        if not last_sync_time:
+            logger.info(f"Full sync: using optimized bulk fetch for space {space_key}")
+            raw_pages = confluence_fetcher.get_all_space_pages_with_content(space_key)
+
+            if not raw_pages and not existing_metadata:
+                return json.dumps(
+                    {"error": f"No pages found in space '{space_key}' or space does not exist."},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+            # Process bulk results
+            for page in raw_pages:
+                page_id = page.get("id")
+                all_page_ids.add(page_id)
+                try:
+                    title = page.get("title", "")
+                    body = page.get("body", {}).get("storage", {}).get("value", "")
+                    version = page.get("version", {}).get("number")
+                    ancestors = page.get("ancestors", [])
+                    ancestor_ids = [a.get("id") for a in ancestors]
+
+                    # Build URL
+                    page_links = page.get("_links", {})
+                    web_ui = page_links.get("webui", "")
+                    base_url = confluence_fetcher.config.url.rstrip("/")
+                    url = f"{base_url}{web_ui}" if web_ui else ""
+
+                    # Get space name from first page
+                    if space_name == space_key:
+                        page_space = page.get("space", {})
+                        space_name = page_space.get("name", space_key)
+
+                    # Check if page has moved
+                    if check_and_cleanup_moved_page(
+                        space_key, page_id, ancestor_ids, existing_metadata
+                    ):
+                        moved_pages.append(page_id)
+
+                    # Save the page
+                    file_path = save_page_html(
+                        space_key=space_key,
+                        page_id=page_id,
+                        title=title,
+                        html_content=body,
+                        version=version,
+                        url=url,
+                        ancestors=ancestor_ids,
+                    )
+
+                    saved_pages.append({
+                        "page_id": page_id,
+                        "title": title,
+                        "version": version,
+                        "url": url,
+                        "path": file_path,
+                        "ancestors": ancestor_ids,
+                        "last_synced": datetime.now(timezone.utc).isoformat(),
+                    })
+
+                    logger.debug(f"Saved page: {title} ({page_id})")
+
+                except Exception as e:
+                    error_msg = f"Failed to sync page {page_id}: {e}"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
+
+        else:
+            # Incremental sync: use CQL to find modified pages, then fetch individually
+            cql_base = f'type=page AND space.key="{space_key}"'
             try:
                 last_dt = datetime.fromisoformat(last_sync_time.replace("Z", "+00:00"))
                 last_sync_date_str = last_dt.strftime("%Y-%m-%d %H:%M")
                 cql_query = f'{cql_base} AND lastModified >= "{last_sync_date_str}"'
             except ValueError:
-                logger.warning(f"Could not parse last sync time: {last_sync_time}, doing full sync")
+                logger.warning(f"Could not parse last sync time: {last_sync_time}")
                 cql_query = cql_base
-        else:
-            cql_query = cql_base
 
-        logger.info(f"Using CQL: {cql_query}")
+            logger.info(f"Incremental sync using CQL: {cql_query}")
+            search_results = confluence_fetcher.search_all(cql_query)
 
-        # Search for ALL pages with pagination (no limit)
-        search_results = confluence_fetcher.search_all(cql_query)
-
-        if not search_results and not existing_metadata:
-            return json.dumps(
-                {"error": f"No pages found in space '{space_key}' or space does not exist."},
-                indent=2,
-                ensure_ascii=False,
-            )
-
-        if not search_results:
-            return json.dumps(
-                {
-                    "success": True,
-                    "space_key": space_key,
-                    "message": "No pages modified since last sync.",
-                    "total_pages_in_cache": existing_metadata.total_pages if existing_metadata else 0,
-                    "last_synced": existing_metadata.last_synced if existing_metadata else None,
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-
-        # Get space name
-        space_name = space_key
-        if search_results and search_results[0].space:
-            space_name = search_results[0].space.name or space_key
-
-        # Process each page: get full content and ancestors
-        saved_pages: list[dict] = []
-        moved_pages: list[str] = []
-        errors: list[str] = []
-
-        for search_page in search_results:
-            page_id = search_page.id
-            try:
-                # Get full page content (as HTML)
-                full_page = confluence_fetcher.get_page_content(
-                    page_id, convert_to_markdown=False
+            if not search_results:
+                return json.dumps(
+                    {
+                        "success": True,
+                        "space_key": space_key,
+                        "message": "No pages modified since last sync.",
+                        "total_pages_in_cache": existing_metadata.total_pages if existing_metadata else 0,
+                        "last_synced": existing_metadata.last_synced if existing_metadata else None,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
                 )
 
-                # Get ancestors for tree structure
-                ancestors = confluence_fetcher.get_page_ancestors(page_id)
-                ancestor_ids = [a.id for a in ancestors]  # Root first, parent last
+            # Get space name
+            if search_results and search_results[0].space:
+                space_name = search_results[0].space.name or space_key
 
-                # Check if page has moved and cleanup old location
-                if check_and_cleanup_moved_page(
-                    space_key, page_id, ancestor_ids, existing_metadata
-                ):
-                    moved_pages.append(page_id)
+            # Process modified pages (need individual fetch for content)
+            for search_page in search_results:
+                page_id = search_page.id
+                all_page_ids.add(page_id)
+                try:
+                    # Get full page content with expand (single API call per page)
+                    full_page = confluence_fetcher.get_page_content(
+                        page_id, convert_to_markdown=False
+                    )
+                    ancestors = confluence_fetcher.get_page_ancestors(page_id)
+                    ancestor_ids = [a.id for a in ancestors]
 
-                # Save the page
-                html_content = full_page.content or ""
-                version_num = full_page.version.number if full_page.version else None
-                file_path = save_page_html(
-                    space_key=space_key,
-                    page_id=page_id,
-                    title=full_page.title,
-                    html_content=html_content,
-                    version=version_num,
-                    url=full_page.url,
-                    ancestors=ancestor_ids,
-                )
+                    if check_and_cleanup_moved_page(
+                        space_key, page_id, ancestor_ids, existing_metadata
+                    ):
+                        moved_pages.append(page_id)
 
-                saved_pages.append({
-                    "page_id": page_id,
-                    "title": full_page.title,
-                    "version": version_num,
-                    "url": full_page.url,
-                    "path": file_path,
-                    "ancestors": ancestor_ids,
-                    "last_synced": datetime.now(timezone.utc).isoformat(),
-                })
+                    html_content = full_page.content or ""
+                    version_num = full_page.version.number if full_page.version else None
+                    file_path = save_page_html(
+                        space_key=space_key,
+                        page_id=page_id,
+                        title=full_page.title,
+                        html_content=html_content,
+                        version=version_num,
+                        url=full_page.url,
+                        ancestors=ancestor_ids,
+                    )
 
-                logger.debug(f"Saved page: {full_page.title} ({page_id})")
+                    saved_pages.append({
+                        "page_id": page_id,
+                        "title": full_page.title,
+                        "version": version_num,
+                        "url": full_page.url,
+                        "path": file_path,
+                        "ancestors": ancestor_ids,
+                        "last_synced": datetime.now(timezone.utc).isoformat(),
+                    })
 
-            except Exception as e:
-                error_msg = f"Failed to sync page {page_id}: {e}"
-                logger.error(error_msg)
-                errors.append(error_msg)
+                    logger.debug(f"Saved page: {full_page.title} ({page_id})")
+
+                except Exception as e:
+                    error_msg = f"Failed to sync page {page_id}: {e}"
+                    logger.error(error_msg)
+                    errors.append(error_msg)
 
         # For full sync, cleanup pages that were deleted from Confluence
         deleted_pages: list[str] = []
-        if full_sync and existing_metadata:
-            confluence_page_ids = {p.id for p in search_results}
+        if full_sync and existing_metadata and all_page_ids:
             deleted_pages = cleanup_deleted_pages(
-                space_key, confluence_page_ids, existing_metadata
+                space_key, all_page_ids, existing_metadata
             )
 
         # Merge into metadata

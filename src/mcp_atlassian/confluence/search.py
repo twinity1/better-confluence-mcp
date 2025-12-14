@@ -152,6 +152,54 @@ class SearchMixin(ConfluenceClient):
         # Return the list of result pages with processed content
         return processed_pages
 
+    # Smaller batch size for bulk content fetch (full HTML is large)
+    BULK_CONTENT_LIMIT = 50
+
+    @handle_atlassian_api_errors("Confluence API")
+    def get_all_space_pages_with_content(
+        self, space_key: str
+    ) -> list[dict]:
+        """
+        Get all pages from a space with content and ancestors in minimal API calls.
+
+        Uses /rest/api/content with expand to get body.storage, ancestors, and version
+        in a single paginated request. Much faster than fetching each page individually.
+
+        Args:
+            space_key: The space key to fetch pages from
+
+        Returns:
+            List of page dicts with id, title, body.storage, ancestors, version
+        """
+        all_pages: list[dict] = []
+        start = 0
+
+        while True:
+            logger.debug(f"Fetching space pages: start={start}, limit={self.BULK_CONTENT_LIMIT}")
+            result = self.confluence.get(
+                "rest/api/content",
+                params={
+                    "spaceKey": space_key,
+                    "type": "page",
+                    "expand": "body.storage,ancestors,version",
+                    "limit": self.BULK_CONTENT_LIMIT,
+                    "start": start,
+                },
+            )
+
+            pages = result.get("results", [])
+            all_pages.extend(pages)
+            logger.info(f"Fetched {len(all_pages)} pages so far...")
+
+            # Check pagination
+            if len(pages) == 0 or len(pages) < self.BULK_CONTENT_LIMIT:
+                break
+
+            start += len(pages)
+
+        logger.info(f"Fetched {len(all_pages)} pages with content from space {space_key}")
+        return all_pages
+
     @handle_atlassian_api_errors("Confluence API")
     def search_user(
         self, cql: str, limit: int = 10

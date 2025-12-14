@@ -82,59 +82,91 @@ async def auto_sync_spaces_background(confluence_config: ConfluenceConfig) -> No
                 except (ValueError, AttributeError):
                     pass
 
-                # Build CQL query
-                cql_base = f'type=page AND space.key="{space_key}"'
-                if not full_sync:
+                saved_count = 0
+                all_page_ids: set[str] = set()
+
+                if full_sync:
+                    # Use optimized bulk fetch for full sync
+                    raw_pages = fetcher.get_all_space_pages_with_content(space_key)
+                    if not raw_pages:
+                        logger.debug(f"Space {space_key}: no pages found")
+                        continue
+
+                    for page in raw_pages:
+                        page_id = page.get("id")
+                        all_page_ids.add(page_id)
+                        try:
+                            title = page.get("title", "")
+                            body = page.get("body", {}).get("storage", {}).get("value", "")
+                            version = page.get("version", {}).get("number")
+                            ancestors = page.get("ancestors", [])
+                            ancestor_ids = [a.get("id") for a in ancestors]
+                            page_links = page.get("_links", {})
+                            web_ui = page_links.get("webui", "")
+                            base_url = fetcher.config.url.rstrip("/")
+                            url = f"{base_url}{web_ui}" if web_ui else ""
+
+                            check_and_cleanup_moved_page(
+                                space_key, page_id, ancestor_ids, existing_metadata
+                            )
+
+                            save_page_html(
+                                space_key=space_key,
+                                page_id=page_id,
+                                title=title,
+                                html_content=body,
+                                version=version,
+                                url=url,
+                                ancestors=ancestor_ids,
+                            )
+                            saved_count += 1
+                        except Exception as e:
+                            logger.debug(f"Failed to sync page {page_id}: {e}")
+
+                    # Cleanup deleted pages
+                    deleted = cleanup_deleted_pages(space_key, all_page_ids, existing_metadata)
+                    if deleted:
+                        logger.debug(f"Space {space_key}: cleaned up {len(deleted)} deleted pages")
+                else:
+                    # Incremental sync using CQL
+                    cql_base = f'type=page AND space.key="{space_key}"'
                     last_dt = datetime.fromisoformat(
                         existing_metadata.last_synced.replace("Z", "+00:00")
                     )
                     last_sync_date_str = last_dt.strftime("%Y-%m-%d %H:%M")
                     cql_query = f'{cql_base} AND lastModified >= "{last_sync_date_str}"'
-                else:
-                    cql_query = cql_base
 
-                # Search for ALL pages with pagination
-                search_results = fetcher.search_all(cql_query)
+                    search_results = fetcher.search_all(cql_query)
+                    if not search_results:
+                        logger.debug(f"Space {space_key}: no changes since last sync")
+                        continue
 
-                if not search_results:
-                    logger.debug(f"Space {space_key}: no changes since last sync")
-                    continue
+                    for search_page in search_results:
+                        try:
+                            full_page = fetcher.get_page_content(
+                                search_page.id, convert_to_markdown=False
+                            )
+                            ancestors = fetcher.get_page_ancestors(search_page.id)
+                            ancestor_ids = [a.id for a in ancestors]
 
-                # Process pages
-                saved_count = 0
-                for search_page in search_results:
-                    try:
-                        full_page = fetcher.get_page_content(
-                            search_page.id, convert_to_markdown=False
-                        )
-                        ancestors = fetcher.get_page_ancestors(search_page.id)
-                        ancestor_ids = [a.id for a in ancestors]
+                            check_and_cleanup_moved_page(
+                                space_key, search_page.id, ancestor_ids, existing_metadata
+                            )
 
-                        check_and_cleanup_moved_page(
-                            space_key, search_page.id, ancestor_ids, existing_metadata
-                        )
-
-                        html_content = full_page.content or ""
-                        version_num = full_page.version.number if full_page.version else None
-                        save_page_html(
-                            space_key=space_key,
-                            page_id=search_page.id,
-                            title=full_page.title,
-                            html_content=html_content,
-                            version=version_num,
-                            url=full_page.url,
-                            ancestors=ancestor_ids,
-                        )
-                        saved_count += 1
-                    except Exception as e:
-                        logger.debug(f"Failed to sync page {search_page.id}: {e}")
-
-                # Cleanup deleted pages on full sync
-                if full_sync:
-                    confluence_page_ids = {p.id for p in search_results}
-                    deleted = cleanup_deleted_pages(space_key, confluence_page_ids, existing_metadata)
-                    if deleted:
-                        logger.debug(f"Space {space_key}: cleaned up {len(deleted)} deleted pages")
+                            html_content = full_page.content or ""
+                            version_num = full_page.version.number if full_page.version else None
+                            save_page_html(
+                                space_key=space_key,
+                                page_id=search_page.id,
+                                title=full_page.title,
+                                html_content=html_content,
+                                version=version_num,
+                                url=full_page.url,
+                                ancestors=ancestor_ids,
+                            )
+                            saved_count += 1
+                        except Exception as e:
+                            logger.debug(f"Failed to sync page {search_page.id}: {e}")
 
                 logger.info(f"Auto-sync complete for {space_key}: {saved_count} pages updated")
 
