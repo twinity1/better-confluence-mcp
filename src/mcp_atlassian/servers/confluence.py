@@ -339,24 +339,21 @@ async def _sync_space_impl(confluence_fetcher, space_key: str, full_sync: bool) 
 @confluence_mcp.tool(tags={"confluence", "read"})
 async def read_page(
     ctx: Context,
-    page_id: Annotated[
+    page_ids: Annotated[
         str,
-        Field(description="The ID of the page to read"),
+        Field(description="Page ID(s) to read - single ID or comma-separated list (e.g., '123' or '123,456,789')"),
     ],
 ) -> str:
-    """Read a Confluence page by syncing its entire space to the local filesystem.
+    """Read one or more Confluence pages by syncing their space(s) to local filesystem.
 
     ## How It Works
 
-    1. **Fetches page from Confluence** to determine its space
-    2. **Syncs entire space** to .better-confluence-mcp/<SPACE_KEY>/
-    3. **Returns local path** to the HTML file
+    1. **Fetches pages from Confluence** to determine their spaces
+    2. **Syncs each space** to .better-confluence-mcp/<SPACE_KEY>/
+    3. **Returns local paths** to the HTML files
 
-    If the page doesn't exist in Confluence but was previously synced locally,
-    it will use the cached space info and still perform a sync.
-
-    This ensures the full context of the space is available locally for the agent
-    to browse and edit related pages using standard file tools.
+    Supports bulk operations - pass multiple page IDs separated by commas.
+    Pages are grouped by space and each space is synced once.
 
     ## Sync Behavior
 
@@ -371,79 +368,148 @@ async def read_page(
     - Call them SEQUENTIALLY (one at a time).
     - Sync can take up to 15 minutes for large spaces - be patient.
 
-    Returns:
-        - Page metadata (title, version, URL)
-        - local_path: Relative path to the HTML file
-        - absolute_path: Full path to the HTML file
-        - Space sync summary (pages_synced, total_pages_in_space)
-
     Args:
         ctx: The FastMCP context.
-        page_id: The ID of the page to read.
+        page_ids: Single page ID or comma-separated list of page IDs.
 
     Returns:
-        JSON string with page metadata and local path, or error if not found.
+        JSON with page metadata and local paths. For multiple pages, returns array of results.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
-    try:
-        # First, try to get the page to find its space (before acquiring lock)
-        target_page = None
-        page_exists_in_confluence = True
-        space_key = None
-        space_name = None
+    # Parse page IDs (comma-separated)
+    id_list = [pid.strip() for pid in page_ids.split(",") if pid.strip()]
 
+    if not id_list:
+        return json.dumps({"error": "No page IDs provided"}, indent=2, ensure_ascii=False)
+
+    # If single page, use original logic for backward compatibility
+    if len(id_list) == 1:
+        page_id = id_list[0]
         try:
-            target_page = confluence_fetcher.get_page_content(
-                page_id, convert_to_markdown=False
-            )
-            if target_page:
-                space_key = target_page.space.key if target_page.space else None
-                space_name = target_page.space.name if target_page.space else space_key
+            # First, try to get the page to find its space (before acquiring lock)
+            target_page = None
+            page_exists_in_confluence = True
+            space_key = None
+            space_name = None
+
+            try:
+                target_page = confluence_fetcher.get_page_content(
+                    page_id, convert_to_markdown=False
+                )
+                if target_page:
+                    space_key = target_page.space.key if target_page.space else None
+                    space_name = target_page.space.name if target_page.space else space_key
+            except Exception as e:
+                error_str = str(e)
+                if "404" in error_str or "not found" in error_str.lower():
+                    page_exists_in_confluence = False
+                else:
+                    raise
+
+            # If page not found in Confluence, check local storage to find the space
+            if not target_page or not space_key:
+                page_exists_in_confluence = False
+                local_page_info = get_page_info(page_id)
+                if local_page_info:
+                    space_key = local_page_info.get("space_key")
+                    logger.info(f"Page {page_id} not in Confluence, but found locally in space {space_key}")
+                else:
+                    return json.dumps(
+                        {"error": f"Page '{page_id}' does not exist in Confluence or local storage."},
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+
+            logger.info(f"Syncing space '{space_key}' to read page {page_id}")
+
+            # Acquire lock for this space to prevent concurrent syncs
+            space_lock = _get_space_lock(space_key)
+            async with space_lock:
+                return await _read_page_sync_impl(
+                    confluence_fetcher, page_id, space_key, space_name, page_exists_in_confluence
+                )
         except Exception as e:
             error_str = str(e)
             if "404" in error_str or "not found" in error_str.lower():
-                page_exists_in_confluence = False
-            else:
-                raise
-
-        # If page not found in Confluence, check local storage to find the space
-        if not target_page or not space_key:
-            page_exists_in_confluence = False
-            local_page_info = get_page_info(page_id)
-            if local_page_info:
-                space_key = local_page_info.get("space_key")
-                logger.info(f"Page {page_id} not in Confluence, but found locally in space {space_key}")
-            else:
                 return json.dumps(
-                    {"error": f"Page '{page_id}' does not exist in Confluence or local storage."},
+                    {"error": f"Page '{page_id}' does not exist in Confluence."},
                     indent=2,
                     ensure_ascii=False,
                 )
-
-        logger.info(f"Syncing space '{space_key}' to read page {page_id}")
-
-        # Acquire lock for this space to prevent concurrent syncs
-        space_lock = _get_space_lock(space_key)
-        async with space_lock:
-            return await _read_page_sync_impl(
-                confluence_fetcher, page_id, space_key, space_name, page_exists_in_confluence
-            )
-
-    except Exception as e:
-        error_str = str(e)
-        if "404" in error_str or "not found" in error_str.lower():
+            logger.error(f"Failed to read page {page_id}: {e}")
             return json.dumps(
-                {"error": f"Page '{page_id}' does not exist in Confluence."},
+                {"error": f"Failed to read page: {error_str}"},
                 indent=2,
                 ensure_ascii=False,
             )
-        logger.error(f"Failed to read page {page_id}: {e}")
-        return json.dumps(
-            {"error": f"Failed to read page: {error_str}"},
-            indent=2,
-            ensure_ascii=False,
-        )
+
+    # Multiple pages - group by space and sync each space once
+    results = []
+    pages_by_space: dict[str, list[dict]] = {}  # space_key -> [{page_id, exists_in_confluence}]
+
+    # First pass: determine space for each page
+    for page_id in id_list:
+        try:
+            target_page = confluence_fetcher.get_page_content(page_id, convert_to_markdown=False)
+            if target_page and target_page.space:
+                space_key = target_page.space.key
+                if space_key not in pages_by_space:
+                    pages_by_space[space_key] = []
+                pages_by_space[space_key].append({
+                    "page_id": page_id,
+                    "exists": True,
+                    "space_name": target_page.space.name,
+                })
+        except Exception as e:
+            # Try local storage
+            local_info = get_page_info(page_id)
+            if local_info:
+                space_key = local_info.get("space_key")
+                if space_key not in pages_by_space:
+                    pages_by_space[space_key] = []
+                pages_by_space[space_key].append({
+                    "page_id": page_id,
+                    "exists": False,
+                    "space_name": space_key,
+                })
+            else:
+                results.append({
+                    "page_id": page_id,
+                    "error": f"Page not found in Confluence or local storage",
+                })
+
+    # Second pass: sync each space and collect results
+    for space_key, pages in pages_by_space.items():
+        space_name = pages[0].get("space_name", space_key)
+        space_lock = _get_space_lock(space_key)
+        async with space_lock:
+            # Sync the space once
+            await _sync_space_impl(confluence_fetcher, space_key, full_sync=False)
+
+        # Get results for each page in this space
+        new_metadata = load_space_metadata(space_key)
+        for page_info in pages:
+            page_id = page_info["page_id"]
+            page_data = new_metadata.page_index.get(page_id) if new_metadata else None
+            if page_data:
+                results.append({
+                    "success": True,
+                    "page_id": page_id,
+                    "title": page_data.get("title"),
+                    "space_key": space_key,
+                    "version": page_data.get("version"),
+                    "url": page_data.get("url"),
+                    "local_path": page_data.get("path"),
+                    "absolute_path": str(Path.cwd() / page_data["path"]) if page_data.get("path") else None,
+                })
+            else:
+                results.append({
+                    "page_id": page_id,
+                    "error": "Page not found after sync",
+                })
+
+    return json.dumps({"pages": results, "total": len(results)}, indent=2, ensure_ascii=False)
 
 
 async def _read_page_sync_impl(
@@ -610,34 +676,42 @@ async def _read_page_sync_impl(
 @check_write_access
 async def create_page(
     ctx: Context,
-    title: Annotated[
+    titles: Annotated[
         str,
-        Field(description="The title of the new page"),
+        Field(description="Title(s) of new page(s) - single title or comma-separated list (e.g., 'My Page' or 'Page 1,Page 2,Page 3')"),
     ],
     parent_id: Annotated[
         str | None,
-        Field(description="ID of the parent page (page will be created as a child). Provide either parent_id OR sibling_id, not both."),
+        Field(description="ID of the parent page (pages will be created as children). Provide either parent_id OR sibling_id, not both."),
     ] = None,
     sibling_id: Annotated[
         str | None,
-        Field(description="ID of a sibling page (page will be created next to this page, under the same parent). Provide either parent_id OR sibling_id, not both."),
+        Field(description="ID of a sibling page (pages will be created next to this page, under the same parent). Provide either parent_id OR sibling_id, not both."),
     ] = None,
 ) -> str:
-    """Create a new empty page in Confluence.
+    """Create one or more new empty pages in Confluence.
 
-    Creates a page with the given title and saves it locally. Specify either
-    parent_id OR sibling_id to control placement.
+    Creates pages with the given titles and saves them locally. Specify either
+    parent_id OR sibling_id to control placement. All pages are created under
+    the same parent.
+
+    Supports bulk operations - pass multiple titles separated by commas.
 
     Args:
         ctx: The FastMCP context.
-        title: The title of the new page.
-        parent_id: Optional ID of the parent page (creates as child).
+        titles: Single title or comma-separated list of titles.
+        parent_id: Optional ID of the parent page (creates as children).
         sibling_id: Optional ID of a sibling page (creates under same parent).
 
     Returns:
-        JSON string with the new page info and local path.
+        JSON string with the new page info and local paths.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # Parse titles (comma-separated)
+    title_list = [t.strip() for t in titles.split(",") if t.strip()]
+    if not title_list:
+        return json.dumps({"error": "No titles provided"}, indent=2, ensure_ascii=False)
 
     # Validate params - need exactly one of parent_id or sibling_id
     if not parent_id and not sibling_id:
@@ -654,7 +728,7 @@ async def create_page(
         )
 
     try:
-        # If sibling_id provided, get its parent
+        # Determine actual parent and space
         actual_parent_id = parent_id
         space_key = None
 
@@ -667,15 +741,12 @@ async def create_page(
                     ensure_ascii=False,
                 )
             space_key = sibling_page.space.key if sibling_page.space else None
-            # Get sibling's ancestors to find its parent
             ancestors = confluence_fetcher.get_page_ancestors(sibling_id)
             if ancestors:
-                actual_parent_id = ancestors[-1].id  # Last ancestor is immediate parent
+                actual_parent_id = ancestors[-1].id
             else:
-                # Sibling is a root page, so new page will also be root
                 actual_parent_id = None
         else:
-            # Get space from parent
             parent_page = confluence_fetcher.get_page_content(parent_id, convert_to_markdown=False)
             if not parent_page:
                 return json.dumps(
@@ -692,76 +763,96 @@ async def create_page(
                 ensure_ascii=False,
             )
 
-        logger.info(f"Creating page '{title}' in space {space_key} under parent {actual_parent_id}")
-
-        # Create the page with empty content
-        new_page = confluence_fetcher.create_page(
-            space_key=space_key,
-            title=title,
-            body="",
-            parent_id=actual_parent_id,
-            is_markdown=False,
-            content_representation="storage",
-        )
-
-        page_id_str = str(new_page.id)
-
-        # Get ancestors for the new page (parent + parent's ancestors)
+        # Get ancestors once (shared by all new pages)
         ancestor_ids = []
         if actual_parent_id:
             parent_ancestors = confluence_fetcher.get_page_ancestors(actual_parent_id)
             ancestor_ids = [a.id for a in parent_ancestors] + [actual_parent_id]
 
-        # Save the new page directly to local storage (avoid full sync delay)
-        version_num = new_page.version.number if new_page.version else 1
-        file_path = save_page_html(
-            space_key=space_key,
-            page_id=page_id_str,
-            title=new_page.title,
-            html_content="",  # Empty content for new page
-            version=version_num,
-            url=new_page.url,
-            ancestors=ancestor_ids,
-        )
-
-        # Update metadata with the new page
+        # Load/create metadata once
         existing_metadata = load_space_metadata(space_key)
         if not existing_metadata:
-            # Create new metadata if space wasn't synced before
             existing_metadata = SpaceMetadata(
                 space_key=space_key,
-                space_name=space_key,  # Use key as name placeholder
+                space_name=space_key,
                 last_synced=datetime.now(timezone.utc).isoformat(),
                 total_pages=0,
             )
-        existing_metadata.page_index[page_id_str] = {
-            "title": new_page.title,
-            "version": version_num,
-            "url": new_page.url,
-            "path": file_path,
-            "ancestors": ancestor_ids,
-            "last_synced": datetime.now(timezone.utc).isoformat(),
-        }
+
+        results = []
+        for title in title_list:
+            try:
+                logger.info(f"Creating page '{title}' in space {space_key} under parent {actual_parent_id}")
+
+                new_page = confluence_fetcher.create_page(
+                    space_key=space_key,
+                    title=title,
+                    body="",
+                    parent_id=actual_parent_id,
+                    is_markdown=False,
+                    content_representation="storage",
+                )
+
+                page_id_str = str(new_page.id)
+                version_num = new_page.version.number if new_page.version else 1
+                file_path = save_page_html(
+                    space_key=space_key,
+                    page_id=page_id_str,
+                    title=new_page.title,
+                    html_content="",
+                    version=version_num,
+                    url=new_page.url,
+                    ancestors=ancestor_ids,
+                )
+
+                existing_metadata.page_index[page_id_str] = {
+                    "title": new_page.title,
+                    "version": version_num,
+                    "url": new_page.url,
+                    "path": file_path,
+                    "ancestors": ancestor_ids,
+                    "last_synced": datetime.now(timezone.utc).isoformat(),
+                }
+
+                results.append({
+                    "success": True,
+                    "page_id": page_id_str,
+                    "title": new_page.title,
+                    "url": new_page.url,
+                    "local_path": file_path,
+                    "absolute_path": str(Path.cwd() / file_path),
+                })
+            except Exception as e:
+                logger.error(f"Failed to create page '{title}': {e}")
+                results.append({
+                    "title": title,
+                    "error": str(e),
+                })
+
+        # Save metadata once after all pages created
         existing_metadata.total_pages = len(existing_metadata.page_index)
         save_space_metadata(existing_metadata)
 
-        result = {
-            "success": True,
-            "message": f"Page '{title}' created successfully",
-            "page_id": page_id_str,
-            "title": new_page.title,
+        # Return single result for single page (backward compatibility)
+        if len(title_list) == 1:
+            result = results[0]
+            if result.get("success"):
+                result["message"] = f"Page '{result['title']}' created successfully"
+                result["space_key"] = space_key
+                result["parent_id"] = actual_parent_id
+            return json.dumps(result, indent=2, ensure_ascii=False)
+
+        return json.dumps({
+            "pages": results,
+            "total": len(results),
             "space_key": space_key,
-            "url": new_page.url,
-            "local_path": file_path,
-            "absolute_path": str(Path.cwd() / file_path),
             "parent_id": actual_parent_id,
-        }
-        return json.dumps(result, indent=2, ensure_ascii=False)
+        }, indent=2, ensure_ascii=False)
 
     except Exception as e:
-        logger.error(f"Failed to create page '{title}': {e}")
+        logger.error(f"Failed to create pages: {e}")
         return json.dumps(
-            {"error": f"Failed to create page: {str(e)}"},
+            {"error": f"Failed to create pages: {str(e)}"},
             indent=2,
             ensure_ascii=False,
         )
@@ -771,9 +862,9 @@ async def create_page(
 @check_write_access
 async def push_page_update(
     ctx: Context,
-    page_id: Annotated[
+    page_ids: Annotated[
         str,
-        Field(description="The ID of the page to update"),
+        Field(description="Page ID(s) to update - single ID or comma-separated list (e.g., '123' or '123,456,789')"),
     ],
     revision_message: Annotated[
         str,
@@ -781,28 +872,26 @@ async def push_page_update(
     ],
     move_to_parent_id: Annotated[
         str | None,
-        Field(description="Optional: Move page to be a child of this page (appended as last child)."),
+        Field(description="Optional: Move page to be a child of this page (single page only)."),
     ] = None,
     before_page_id: Annotated[
         str | None,
-        Field(description="Optional: Position page right BEFORE this sibling page."),
+        Field(description="Optional: Position page right BEFORE this sibling (single page only)."),
     ] = None,
     after_page_id: Annotated[
         str | None,
-        Field(description="Optional: Position page right AFTER this sibling page."),
+        Field(description="Optional: Position page right AFTER this sibling (single page only)."),
     ] = None,
 ) -> str:
-    """Push local HTML changes to Confluence, optionally moving or renaming the page.
+    """Push local HTML changes to Confluence for one or more pages.
+
+    Supports bulk operations - pass multiple page IDs separated by commas.
+    Each page's content is read from its local HTML file and pushed to Confluence.
 
     The agent should:
-    1. Read the local HTML file (find path in _metadata.json or use the tree structure)
-    2. Make edits to the HTML content
-    3. To RENAME: Edit the "Title:" line in the HTML comment header
-    4. Call this tool with the page_id and revision_message
-
-    The tool will read the current content AND title from the local file and push
-    to Confluence. If you changed the Title in the header comment, the page will
-    be renamed in Confluence.
+    1. Read/edit local HTML files (find paths in _metadata.json or tree structure)
+    2. To RENAME: Edit the "Title:" line in the HTML comment header
+    3. Call this tool with the page_ids and revision_message
 
     CODE BLOCKS in Confluence must use this format:
     <ac:structured-macro ac:name="code" ac:schema-version="1">
@@ -810,39 +899,44 @@ async def push_page_update(
       <ac:plain-text-body><![CDATA[your code here]]></ac:plain-text-body>
     </ac:structured-macro>
 
-    Before updating, it verifies the local version matches Confluence. If someone
-    else edited the page, the local copy is re-synced and an error is returned.
+    Before updating, it verifies each page's local version matches Confluence.
 
-    ## Moving and Reordering Pages
+    ## Moving and Reordering Pages (single page only)
 
-    Use these optional parameters to move or reorder pages:
+    Use these optional parameters to move or reorder a SINGLE page:
     - `move_to_parent_id`: Move page as a child of another page (appended at end)
-    - `before_page_id`: Position page right before a sibling (also moves to same parent)
-    - `after_page_id`: Position page right after a sibling (also moves to same parent)
+    - `before_page_id`: Position page right before a sibling
+    - `after_page_id`: Position page right after a sibling
 
-    Only provide ONE of these parameters.
-
-    IMPORTANT:
-    - If moving the page, this tool syncs the space afterward.
-    - Do NOT call multiple push_page_update (with move) or sync tools in parallel.
-    - Call them SEQUENTIALLY (one at a time).
-    - Sync can take up to 15 minutes for large spaces - be patient.
+    Move parameters are ignored for bulk operations.
 
     Args:
         ctx: The FastMCP context.
-        page_id: The ID of the page to update.
-        revision_message: Description of the changes (shown in Confluence page history).
-        move_to_parent_id: Optional new parent page ID (moves page as last child).
-        before_page_id: Optional page ID to position before (as sibling).
-        after_page_id: Optional page ID to position after (as sibling).
+        page_ids: Single page ID or comma-separated list of page IDs.
+        revision_message: Description of the changes (shared across all pages).
+        move_to_parent_id: Optional new parent page ID (single page only).
+        before_page_id: Optional page ID to position before (single page only).
+        after_page_id: Optional page ID to position after (single page only).
 
     Returns:
-        JSON string indicating success or failure.
+        JSON string indicating success or failure for each page.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
-    # Validate move params - only one can be provided
+    # Parse page IDs
+    id_list = [pid.strip() for pid in page_ids.split(",") if pid.strip()]
+    if not id_list:
+        return json.dumps({"error": "No page IDs provided"}, indent=2, ensure_ascii=False)
+
+    # Validate move params - only one can be provided, and only for single page
     move_params = [move_to_parent_id, before_page_id, after_page_id]
+    has_move = any(p is not None for p in move_params)
+    if has_move and len(id_list) > 1:
+        return json.dumps(
+            {"error": "Move parameters only work with single page, not bulk operations"},
+            indent=2,
+            ensure_ascii=False,
+        )
     if sum(1 for p in move_params if p is not None) > 1:
         return json.dumps(
             {"error": "Provide only ONE of: move_to_parent_id, before_page_id, or after_page_id"},
@@ -852,8 +946,7 @@ async def push_page_update(
 
     # Determine move operation type
     move_target_id = None
-    move_position = None  # 'append', 'before', 'after'
-
+    move_position = None
     if move_to_parent_id:
         move_target_id = move_to_parent_id
         move_position = "append"
@@ -864,214 +957,133 @@ async def push_page_update(
         move_target_id = after_page_id
         move_position = "after"
 
-    # Find the page in local storage
-    page_info = get_page_info(page_id)
+    results = []
+    spaces_to_sync = set()  # Track spaces that need syncing after moves
 
-    if not page_info:
-        return json.dumps(
-            {
-                "error": f"Page '{page_id}' not found in local storage.",
-                "hint": "Use sync_space to sync the space first, then edit the HTML file and call this tool.",
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+    for page_id in id_list:
+        try:
+            # Find the page in local storage
+            page_info = get_page_info(page_id)
+            if not page_info:
+                results.append({
+                    "page_id": page_id,
+                    "error": "Page not found in local storage",
+                })
+                continue
 
-    # Read the local HTML file
-    file_path = Path.cwd() / page_info["path"]
-    if not file_path.exists():
-        return json.dumps(
-            {
-                "error": f"Local file not found: {page_info['path']}",
-                "hint": "The file may have been deleted. Re-sync the space.",
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+            # Read the local HTML file
+            file_path = Path.cwd() / page_info["path"]
+            if not file_path.exists():
+                results.append({
+                    "page_id": page_id,
+                    "error": f"Local file not found: {page_info['path']}",
+                })
+                continue
 
-    space_key = page_info["space_key"]
-    local_version = page_info.get("version")
+            space_key = page_info["space_key"]
+            local_version = page_info.get("version")
 
-    # Check if local version matches Confluence version before updating
-    try:
-        current_page = confluence_fetcher.get_page_content(
-            page_id, convert_to_markdown=False
-        )
-        confluence_version = current_page.version.number if current_page.version else None
+            # Check version mismatch
+            try:
+                current_page = confluence_fetcher.get_page_content(page_id, convert_to_markdown=False)
+                confluence_version = current_page.version.number if current_page.version else None
 
-        if local_version is not None and confluence_version is not None:
-            if local_version != confluence_version:
-                # Version mismatch - re-sync the page and return error
-                logger.warning(
-                    f"Version mismatch for page {page_id}: local={local_version}, confluence={confluence_version}"
-                )
-
-                # Get ancestors for tree structure
-                ancestors = confluence_fetcher.get_page_ancestors(page_id)
-                ancestor_ids = [a.id for a in ancestors]
-
-                # Re-sync the page with latest content
-                html_content = current_page.content or ""
-                new_path = save_page_html(
-                    space_key=space_key,
-                    page_id=page_id,
-                    title=current_page.title,
-                    html_content=html_content,
-                    version=confluence_version,
-                    url=current_page.url,
-                    ancestors=ancestor_ids,
-                )
-
-                # Update metadata
-                existing_metadata = load_space_metadata(space_key)
-                if existing_metadata:
-                    existing_metadata.page_index[page_id] = {
-                        "title": current_page.title,
-                        "version": confluence_version,
-                        "url": current_page.url,
-                        "path": new_path,
-                        "ancestors": ancestor_ids,
-                        "last_synced": datetime.now(timezone.utc).isoformat(),
-                    }
-                    save_space_metadata(existing_metadata)
-
-                return json.dumps(
-                    {
-                        "error": "Page was modified externally",
-                        "message": (
-                            f"The page was edited in Confluence (version {confluence_version}) "
-                            f"since your last sync (version {local_version}). "
-                            "The page has been re-synced with the latest content. "
-                            "Please review the changes, make your edits again, and call push_page_update."
-                        ),
-                        "local_path": new_path,
-                        "local_version": local_version,
-                        "confluence_version": confluence_version,
+                if local_version and confluence_version and local_version != confluence_version:
+                    results.append({
                         "page_id": page_id,
-                        "title": current_page.title,
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                )
+                        "error": f"Version mismatch (local={local_version}, confluence={confluence_version})",
+                    })
+                    continue
+            except Exception as e:
+                logger.warning(f"Could not verify version for {page_id}: {e}")
 
-    except Exception as e:
-        logger.warning(f"Could not verify page version before update: {e}")
-        # Continue with update attempt - let it fail naturally if there's a real issue
+            # Read and parse content
+            with open(file_path, encoding="utf-8") as f:
+                content = f.read()
 
-    with open(file_path, encoding="utf-8") as f:
-        content = f.read()
+            page_title = page_info["title"]
+            if content.startswith("<!--"):
+                end_comment = content.find("-->")
+                if end_comment != -1:
+                    header = content[:end_comment]
+                    title_match = re.search(r"^\s*Title:\s*(.+)$", header, re.MULTILINE)
+                    if title_match:
+                        page_title = title_match.group(1).strip()
+                    content = content[end_comment + 3:].lstrip("\n")
 
-    # Parse title from the metadata comment header (allows renaming)
-    page_title = page_info["title"]  # Default to metadata title
-    if content.startswith("<!--"):
-        end_comment = content.find("-->")
-        if end_comment != -1:
-            header = content[:end_comment]
-            # Extract title from header: "  Title: Page Name"
-            title_match = re.search(r"^\s*Title:\s*(.+)$", header, re.MULTILINE)
-            if title_match:
-                page_title = title_match.group(1).strip()
-            # Strip the header from content
-            content = content[end_comment + 3:].lstrip("\n")
-
-    try:
-        # Determine if we're moving/reordering the page
-        is_moving = move_target_id is not None
-
-        # Update the page content in Confluence using storage format (HTML)
-        # Note: We don't pass parent_id here anymore - we use move_page() for positioning
-        updated_page = confluence_fetcher.update_page(
-            page_id=page_id,
-            title=page_title,  # Use title from HTML header (enables renaming)
-            body=content,
-            is_minor_edit=False,
-            version_comment=revision_message,
-            is_markdown=False,
-            content_representation="storage",
-        )
-
-        # If moving/reordering, use move_page to position the page
-        if is_moving and move_target_id and move_position:
-            confluence_fetcher.move_page(
+            # Update page in Confluence
+            updated_page = confluence_fetcher.update_page(
                 page_id=page_id,
-                target_id=move_target_id,
-                position=move_position,
+                title=page_title,
+                body=content,
+                is_minor_edit=False,
+                version_comment=revision_message,
+                is_markdown=False,
+                content_representation="storage",
             )
 
-            # Sync the space to update local file structure
-            space_lock = _get_space_lock(space_key)
-            async with space_lock:
-                await _sync_space_impl(confluence_fetcher, space_key, full_sync=False)
+            # Handle move (single page only)
+            if move_target_id and move_position:
+                confluence_fetcher.move_page(
+                    page_id=page_id,
+                    target_id=move_target_id,
+                    position=move_position,
+                )
+                spaces_to_sync.add(space_key)
 
-            # Get updated page info from metadata
-            new_metadata = load_space_metadata(space_key)
-            page_data = new_metadata.page_index.get(page_id) if new_metadata else None
+            # Update local storage
+            ancestors = page_info.get("ancestors", [])
             version_num = updated_page.version.number if updated_page.version else None
+            new_path = save_page_html(
+                space_key=space_key,
+                page_id=page_id,
+                title=updated_page.title,
+                html_content=content,
+                version=version_num,
+                url=updated_page.url,
+                ancestors=ancestors,
+            )
 
-            result = {
+            # Update metadata
+            existing_metadata = load_space_metadata(space_key)
+            if existing_metadata:
+                existing_metadata.page_index[page_id] = {
+                    "title": updated_page.title,
+                    "version": version_num,
+                    "url": updated_page.url,
+                    "path": new_path,
+                    "ancestors": ancestors,
+                    "last_synced": datetime.now(timezone.utc).isoformat(),
+                }
+                save_space_metadata(existing_metadata)
+
+            results.append({
                 "success": True,
-                "message": f"Page updated and positioned ({move_position} {move_target_id})",
                 "page_id": page_id,
                 "title": updated_page.title,
                 "new_version": version_num,
                 "url": updated_page.url,
-                "revision_message": revision_message,
-                "move_position": move_position,
-                "move_target_id": move_target_id,
-                "local_path": page_data["path"] if page_data else None,
-                "absolute_path": str(Path.cwd() / page_data["path"]) if page_data else None,
-            }
-            return json.dumps(result, indent=2, ensure_ascii=False)
+            })
 
-        # Not moving - just update local storage with new version
-        ancestors = page_info.get("ancestors", [])
-        version_num = updated_page.version.number if updated_page.version else None
-        new_path = save_page_html(
-            space_key=space_key,
-            page_id=page_id,
-            title=updated_page.title,
-            html_content=content,
-            version=version_num,
-            url=updated_page.url,
-            ancestors=ancestors,
-        )
-
-        # Update metadata
-        existing_metadata = load_space_metadata(space_key)
-        if existing_metadata:
-            existing_metadata.page_index[page_id] = {
-                "title": updated_page.title,
-                "version": version_num,
-                "url": updated_page.url,
-                "path": new_path,
-                "ancestors": ancestors,
-                "last_synced": datetime.now(timezone.utc).isoformat(),
-            }
-            existing_metadata.last_synced = datetime.now(timezone.utc).isoformat()
-            save_space_metadata(existing_metadata)
-
-        result = {
-            "success": True,
-            "message": "Page updated successfully",
-            "page_id": page_id,
-            "title": updated_page.title,
-            "new_version": version_num,
-            "url": updated_page.url,
-            "revision_message": revision_message,
-        }
-        return json.dumps(result, indent=2, ensure_ascii=False)
-
-    except Exception as e:
-        logger.error(f"Failed to update page {page_id}: {e}")
-        return json.dumps(
-            {
-                "success": False,
-                "error": f"Failed to update page: {str(e)}",
+        except Exception as e:
+            logger.error(f"Failed to update page {page_id}: {e}")
+            results.append({
                 "page_id": page_id,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+                "error": str(e),
+            })
+
+    # Sync spaces that had pages moved
+    for space_key in spaces_to_sync:
+        space_lock = _get_space_lock(space_key)
+        async with space_lock:
+            await _sync_space_impl(confluence_fetcher, space_key, full_sync=False)
+
+    return json.dumps({
+        "pages": results,
+        "total": len(results),
+        "success_count": sum(1 for r in results if r.get("success")),
+        "revision_message": revision_message,
+    }, indent=2, ensure_ascii=False)
 
 
 # =============================================================================

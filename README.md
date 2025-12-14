@@ -41,9 +41,9 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 | Tool | Description |
 |------|-------------|
 | `confluence_sync_space` | Sync a Confluence space to local filesystem |
-| `confluence_read_page` | Read a page (syncs entire space to local filesystem) |
-| `confluence_create_page` | Create a new page |
-| `confluence_push_page_update` | Push changes, rename, move, or reorder a page |
+| `confluence_read_page` | Read page(s) - supports bulk via comma-separated IDs |
+| `confluence_create_page` | Create page(s) - supports bulk via comma-separated titles |
+| `confluence_push_page_update` | Push changes to page(s) - supports bulk via comma-separated IDs |
 | `confluence_download_attachments` | Download all attachments from a page |
 | `confluence_upload_attachment` | Upload a file as attachment |
 | `confluence_get_spaces` | List available spaces |
