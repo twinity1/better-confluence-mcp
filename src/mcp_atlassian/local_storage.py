@@ -195,8 +195,9 @@ def _prettify_element(element, indent_level: int = 0) -> str:
 
     Block elements get their own lines with indentation.
     Inline text stays on the same line as its parent tag.
+    CDATA sections in ac:plain-text-body are preserved for Confluence code blocks.
     """
-    from bs4 import NavigableString, Tag
+    from bs4 import CData, NavigableString, Tag
 
     indent = "  " * indent_level
     result = []
@@ -211,11 +212,18 @@ def _prettify_element(element, indent_level: int = 0) -> str:
         'ac:rich-text-body', 'ac:parameter', 'ac:plain-text-body'
     }
 
+    # Elements that should preserve their raw content (including CDATA)
+    preserve_content_elements = {'ac:plain-text-body'}
+
     for child in element.children:
         if isinstance(child, NavigableString):
-            text = str(child).strip()
-            if text:
-                result.append(text)
+            # Check if it's CDATA - preserve with wrapper
+            if isinstance(child, CData):
+                result.append(f"<![CDATA[{child}]]>")
+            else:
+                text = str(child).strip()
+                if text:
+                    result.append(text)
         elif isinstance(child, Tag):
             tag_name = child.name.lower() if child.name else ''
             is_block = tag_name in block_elements
@@ -227,6 +235,23 @@ def _prettify_element(element, indent_level: int = 0) -> str:
                     value = ' '.join(value)
                 attrs.append(f'{key}="{value}"')
             attrs_str = ' ' + ' '.join(attrs) if attrs else ''
+
+            # Special handling for elements that need raw content preserved (code blocks)
+            if tag_name in preserve_content_elements:
+                # Preserve CDATA content exactly as-is for code blocks
+                inner_content = ""
+                for c in child.children:
+                    if isinstance(c, CData):
+                        inner_content += f"<![CDATA[{c}]]>"
+                    elif isinstance(c, NavigableString):
+                        # Wrap non-CDATA text in CDATA for safety
+                        text = str(c)
+                        if text.strip():
+                            inner_content += f"<![CDATA[{text}]]>"
+                    else:
+                        inner_content += str(c)
+                result.append(f"<{child.name}{attrs_str}>{inner_content}</{child.name}>")
+                continue
 
             # Check if element has only text content (no nested tags)
             has_only_text = all(
