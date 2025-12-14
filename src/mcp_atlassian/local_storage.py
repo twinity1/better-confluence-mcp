@@ -144,6 +144,36 @@ class SpaceMetadata:
         )
 
 
+def fix_html_spacing(html_content: str) -> str:
+    """Fix spacing issues in HTML content.
+
+    Ensures space exists between text and inline formatting tags like <strong>, <em>, etc.
+    Example: 'Click on<strong>Button</strong>' -> 'Click on <strong>Button</strong>'
+    """
+    # Inline formatting tags that typically need space before them
+    inline_tags = r"(?:strong|em|b|i|u|code|span|a)"
+
+    # Add space before opening tag if preceded by word character (not already spaced)
+    # Match: word char + < + tag (no space between)
+    html_content = re.sub(
+        rf"(\w)(<{inline_tags}[\s>])",
+        r"\1 \2",
+        html_content,
+        flags=re.IGNORECASE,
+    )
+
+    # Add space after closing tag if followed by word character (not already spaced)
+    # Match: </tag> + word char (no space between)
+    html_content = re.sub(
+        rf"(</{inline_tags}>)(\w)",
+        r"\1 \2",
+        html_content,
+        flags=re.IGNORECASE,
+    )
+
+    return html_content
+
+
 def prettify_html(html_content: str) -> str:
     """Format HTML content for readability.
 
@@ -151,6 +181,8 @@ def prettify_html(html_content: str) -> str:
     For example: <p>Text here</p> instead of <p>\n Text here\n</p>
     """
     try:
+        # Fix spacing issues first
+        html_content = fix_html_spacing(html_content)
         soup = BeautifulSoup(html_content, "html.parser")
         return _prettify_element(soup, indent_level=0)
     except Exception as e:
