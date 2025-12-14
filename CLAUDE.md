@@ -31,18 +31,6 @@ The server only supports **stdio** transport.
 
 ## Testing MCP Servers
 
-### Using MCP Inspector (Recommended)
-
-The MCP Inspector is an interactive developer tool for testing and debugging MCP servers.
-
-```bash
-# Test this MCP server locally
-npx @modelcontextprotocol/inspector uv --directory . run better-confluence-mcp
-
-# General pattern for Python MCP servers
-npx @modelcontextprotocol/inspector uvx <package-name> <args>
-```
-
 ### Using JSON-RPC from Command Line
 
 MCP servers communicate via JSON-RPC over stdio. You can test directly:
@@ -108,17 +96,10 @@ print("Result:", json.dumps(call_response, indent=2))
 proc.terminate()
 ```
 
-### Inspector Features
-- **Tools Tab**: List available tools, view schemas, test with custom inputs
-- **Resources Tab**: View available resources, inspect metadata
-- **Prompts Tab**: Test prompt templates with custom arguments
-- **Notifications Pane**: View logs and notifications from the server
-
 ### Testing Best Practices
 - Verify basic connectivity first with `initialize` and `tools/list`
 - Test edge cases: invalid inputs, missing arguments
 - Monitor error handling and error responses
-- After server changes: rebuild, reconnect Inspector, test affected features
 
 ## Running Tests
 
@@ -148,3 +129,26 @@ After syncing, files are stored in `.better-confluence-mcp/`:
 ```
 
 Each HTML file includes metadata in a comment header with page ID, version, and sync timestamp.
+
+## Publishing
+
+To publish a new version to PyPI:
+
+```bash
+# 1. Commit your changes
+git add . && git commit -m "your commit message"
+
+# 2. Create a version tag (e.g., v0.1.10)
+git tag v0.1.10
+
+# 3. Push commit and tag
+git push && git push --tags
+
+# 4. Build the package
+uv build
+
+# 5. Publish to PyPI
+uv publish
+```
+
+The version is derived from git tags via `setuptools-scm` (configured in `pyproject.toml`).
