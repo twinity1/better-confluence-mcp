@@ -1,9 +1,20 @@
 [project]
-name = "mcp-atlassian"
+name = "better-confluence-mcp"
 dynamic = ["version"]
-description = "The Model Context Protocol (MCP) Atlassian integration is an open-source implementation that bridges Atlassian products (Jira and Confluence) with AI language models following Anthropic's MCP specification. This project enables secure, contextual AI interactions with Atlassian tools while maintaining data privacy and security. Key features include:"
+description = "MCP server for Confluence with local filesystem caching. Sync spaces locally, edit HTML files, and push changes back. Features: tree-based storage, incremental sync, version conflict detection, auto full-sync every 3 days."
 readme = "README.md"
 requires-python = ">=3.10"
+license = {text = "MIT"}
+keywords = ["mcp", "confluence", "atlassian", "ai", "llm", "sync", "cache"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "atlassian-python-api>=4.0.0",
     "requests[socks]>=2.31.0",
@@ -27,15 +38,26 @@ dependencies = [
     "cachetools>=5.0.0",
     "types-cachetools>=5.5.0.20240820",
 ]
+
 [[project.authors]]
-name = "sooperset"
-email = "soomiles.dev@gmail.com"
+name = "Ales Kutek"
+email = "ales.kutek@designeo.cz"
+
+[project.urls]
+Homepage = "https://github.com/twinity1/better-confluence-mcp"
+Repository = "https://github.com/twinity1/better-confluence-mcp"
+Issues = "https://github.com/twinity1/better-confluence-mcp/issues"
 
 [build-system]
 requires = ["hatchling", "uv-dynamic-versioning>=0.7.0"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_atlassian"]
+
 [project.scripts]
+better-confluence-mcp = "mcp_atlassian:main"
+# Keep old name for backwards compatibility
 mcp-atlassian = "mcp_atlassian:main"
 
 [dependency-groups]

@@ -1,8 +1,8 @@
 """
-Base models and utility classes for the MCP Atlassian API models.
+Base models and utility classes for the MCP Confluence API models.
 
 This module provides base classes and mixins that are used by the
-Jira and Confluence models to ensure consistent behavior and reduce
+Confluence models to ensure consistent behavior and reduce
 code duplication.
 """
 

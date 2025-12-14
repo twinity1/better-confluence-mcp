@@ -1,5 +1,5 @@
 """
-Root pytest configuration file for MCP Atlassian tests.
+Root pytest configuration file for Better Confluence MCP tests.
 
 This module provides session-scoped fixtures and utilities that are shared
 across all test modules. It integrates with the new test utilities framework
@@ -12,7 +12,6 @@ from tests.utils.factories import (
     AuthConfigFactory,
     ConfluencePageFactory,
     ErrorResponseFactory,
-    JiraIssueFactory,
 )
 from tests.utils.mocks import MockAtlassianClient, MockEnvironment
 
@@ -38,19 +37,13 @@ def session_auth_configs():
     Session-scoped fixture providing authentication configuration templates.
 
     This fixture is computed once per test session and provides standard
-    authentication configurations for OAuth and basic auth scenarios.
+    authentication configurations for basic auth scenarios.
 
     Returns:
         Dict[str, Dict[str, str]]: Authentication configuration templates
     """
     return {
-        "oauth": AuthConfigFactory.create_oauth_config(),
         "basic_auth": AuthConfigFactory.create_basic_auth_config(),
-        "jira_basic": {
-            "url": "https://test.atlassian.net",
-            "username": "test@example.com",
-            "api_token": "test-jira-token",
-        },
         "confluence_basic": {
             "url": "https://test.atlassian.net/wiki",
             "username": "test@example.com",
@@ -71,21 +64,9 @@ def session_mock_data():
         Dict[str, Any]: Mock data templates for various API responses
     """
     return {
-        "jira_issue": JiraIssueFactory.create(),
-        "jira_issue_minimal": JiraIssueFactory.create_minimal(),
         "confluence_page": ConfluencePageFactory.create(),
         "api_error": ErrorResponseFactory.create_api_error(),
         "auth_error": ErrorResponseFactory.create_auth_error(),
-        "jira_search_results": {
-            "issues": [
-                JiraIssueFactory.create("TEST-1"),
-                JiraIssueFactory.create("TEST-2"),
-                JiraIssueFactory.create("TEST-3"),
-            ],
-            "total": 3,
-            "startAt": 0,
-            "maxResults": 50,
-        },
     }
 
 
@@ -106,23 +87,11 @@ def clean_environment():
 
 
 @pytest.fixture
-def oauth_environment():
-    """
-    Fixture that provides a complete OAuth environment setup.
-
-    This sets up all necessary OAuth environment variables for testing
-    OAuth-based authentication flows.
-    """
-    with MockEnvironment.oauth_env() as env:
-        yield env
-
-
-@pytest.fixture
 def basic_auth_environment():
     """
     Fixture that provides basic authentication environment setup.
 
-    This sets up username/token authentication for both Jira and Confluence.
+    This sets up username/token authentication for Confluence.
     """
     with MockEnvironment.basic_auth_env() as env:
         yield env
@@ -131,23 +100,6 @@ def basic_auth_environment():
 # ============================================================================
 # Factory-Based Fixtures
 # ============================================================================
-
-
-@pytest.fixture
-def make_jira_issue():
-    """
-    Factory fixture for creating Jira issues with customizable properties.
-
-    Returns:
-        Callable: Factory function that creates Jira issue data
-
-    Example:
-        def test_issue_creation(make_jira_issue):
-            issue = make_jira_issue(key="CUSTOM-123",
-                                  fields={"priority": {"name": "High"}})
-            assert issue["key"] == "CUSTOM-123"
-    """
-    return JiraIssueFactory.create
 
 
 @pytest.fixture
@@ -176,12 +128,11 @@ def make_auth_config():
         Dict[str, Callable]: Factory functions for different auth types
 
     Example:
-        def test_oauth_config(make_auth_config):
-            config = make_auth_config["oauth"](client_id="custom-id")
-            assert config["client_id"] == "custom-id"
+        def test_basic_config(make_auth_config):
+            config = make_auth_config["basic"](url="https://custom.atlassian.net")
+            assert "custom" in config["url"]
     """
     return {
-        "oauth": AuthConfigFactory.create_oauth_config,
         "basic": AuthConfigFactory.create_basic_auth_config,
     }
 
@@ -208,20 +159,6 @@ def make_api_error():
 
 
 @pytest.fixture
-def mock_jira_client():
-    """
-    Fixture providing a pre-configured mock Jira client.
-
-    The client comes with sensible defaults for common operations
-    but can be customized per test as needed.
-
-    Returns:
-        MagicMock: Configured mock Jira client
-    """
-    return MockAtlassianClient.create_jira_client()
-
-
-@pytest.fixture
 def mock_confluence_client():
     """
     Fixture providing a pre-configured mock Confluence client.
@@ -238,18 +175,6 @@ def mock_confluence_client():
 # ============================================================================
 # Compatibility Fixtures (maintain backward compatibility)
 # ============================================================================
-
-
-@pytest.fixture
-def use_real_jira_data(request):
-    """
-    Check if real Jira data tests should be run.
-
-    This will be True if the --use-real-data flag is passed to pytest.
-
-    Note: This fixture is maintained for backward compatibility.
-    """
-    return request.config.getoption("--use-real-data")
 
 
 @pytest.fixture
@@ -279,8 +204,8 @@ def env_var_manager():
 
     Example:
         def test_with_custom_env(env_var_manager):
-            with env_var_manager.oauth_env():
-                # Test OAuth functionality
+            with env_var_manager.basic_auth_env():
+                # Test basic auth functionality
                 pass
     """
     return MockEnvironment
@@ -296,17 +221,14 @@ def parametrized_auth_env(request):
 
     Example:
         @pytest.mark.parametrize("parametrized_auth_env",
-                               ["oauth", "basic_auth"], indirect=True)
+                               ["basic_auth"], indirect=True)
         def test_auth_scenarios(parametrized_auth_env):
-            # Test will run once for OAuth and once for basic auth
+            # Test will run with basic auth
             pass
     """
     auth_type = request.param
 
-    if auth_type == "oauth":
-        with MockEnvironment.oauth_env() as env:
-            yield env
-    elif auth_type == "basic_auth":
+    if auth_type == "basic_auth":
         with MockEnvironment.basic_auth_env() as env:
             yield env
     elif auth_type == "clean":
@@ -336,7 +258,6 @@ def validate_test_environment():
         # Check if modules can be imported
         for module_name in [
             "tests.fixtures.confluence_mocks",
-            "tests.fixtures.jira_mocks",
             "tests.utils.base",
             "tests.utils.factories",
             "tests.utils.mocks",
@@ -348,9 +269,9 @@ def validate_test_environment():
         pytest.fail(f"Failed to import test utilities: {e}")
 
     # Log session start
-    print("\n🧪 Starting MCP Atlassian test session with enhanced fixtures")
+    print("\n🧪 Starting Better Confluence MCP test session with enhanced fixtures")
 
     yield
 
     # Log session end
-    print("\n✅ Completed MCP Atlassian test session")
+    print("\n✅ Completed Better Confluence MCP test session")

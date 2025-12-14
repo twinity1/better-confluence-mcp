@@ -1,38 +1,148 @@
 """Main FastMCP server setup for Atlassian integration."""
 
+import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, Literal, Optional
 
-from cachetools import TTLCache
 from fastmcp import FastMCP
 from fastmcp.tools import Tool as FastMCPTool
 from mcp.types import Tool as MCPTool
-from starlette.applications import Starlette
-from starlette.middleware import Middleware
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
-from mcp_atlassian.confluence import ConfluenceFetcher
 from mcp_atlassian.confluence.config import ConfluenceConfig
-from mcp_atlassian.jira import JiraFetcher
-from mcp_atlassian.jira.config import JiraConfig
+from mcp_atlassian.local_storage import (
+    ensure_gitignore_entry,
+    get_all_synced_spaces,
+    load_space_metadata,
+    save_page_html,
+    cleanup_deleted_pages,
+    check_and_cleanup_moved_page,
+)
 from mcp_atlassian.utils.environment import get_available_services
 from mcp_atlassian.utils.io import is_read_only_mode
-from mcp_atlassian.utils.logging import mask_sensitive
 from mcp_atlassian.utils.tools import get_enabled_tools, should_include_tool
 
-from .confluence import confluence_mcp
+from .confluence import confluence_mcp, AUTO_FULL_SYNC_DAYS
 from .context import MainAppContext
-from .jira import jira_mcp
 
 logger = logging.getLogger("mcp-atlassian.server.main")
 
 
-async def health_check(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+def is_auto_sync_enabled() -> bool:
+    """Check if auto-sync on startup is enabled."""
+    val = os.environ.get("AUTO_SYNC_ON_STARTUP", "true").lower()
+    return val in ("true", "1", "yes")
+
+
+def is_gitignore_auto_add_enabled() -> bool:
+    """Check if auto-adding to .gitignore is enabled."""
+    val = os.environ.get("AUTO_ADD_GITIGNORE", "true").lower()
+    return val in ("true", "1", "yes")
+
+
+async def auto_sync_spaces_background(confluence_config: ConfluenceConfig) -> None:
+    """Sync all locally stored spaces in the background.
+
+    This runs after server startup to keep local caches up to date.
+    """
+    from datetime import datetime, timezone
+
+    from mcp_atlassian.confluence import ConfluenceFetcher
+
+    synced_spaces = get_all_synced_spaces()
+    if not synced_spaces:
+        logger.debug("No locally synced spaces found, skipping auto-sync")
+        return
+
+    logger.info(f"Auto-syncing {len(synced_spaces)} spaces: {synced_spaces}")
+
+    try:
+        fetcher = ConfluenceFetcher(confluence_config)
+
+        for space_key in synced_spaces:
+            try:
+                logger.info(f"Auto-syncing space: {space_key}")
+
+                existing_metadata = load_space_metadata(space_key)
+                if not existing_metadata:
+                    logger.warning(f"No metadata for space {space_key}, skipping")
+                    continue
+
+                # Check if we need full sync
+                full_sync = False
+                try:
+                    last_dt = datetime.fromisoformat(
+                        existing_metadata.last_synced.replace("Z", "+00:00")
+                    )
+                    days_since_sync = (datetime.now(timezone.utc) - last_dt).days
+                    if days_since_sync >= AUTO_FULL_SYNC_DAYS:
+                        full_sync = True
+                        logger.info(f"Space {space_key}: triggering full sync ({days_since_sync} days old)")
+                except (ValueError, AttributeError):
+                    pass
+
+                # Build CQL query
+                cql_base = f'type=page AND space.key="{space_key}"'
+                if not full_sync:
+                    last_dt = datetime.fromisoformat(
+                        existing_metadata.last_synced.replace("Z", "+00:00")
+                    )
+                    last_sync_date_str = last_dt.strftime("%Y-%m-%d %H:%M")
+                    cql_query = f'{cql_base} AND lastModified >= "{last_sync_date_str}"'
+                else:
+                    cql_query = cql_base
+
+                # Search for pages
+                search_results = fetcher.search(cql_query, limit=500)
+
+                if not search_results:
+                    logger.debug(f"Space {space_key}: no changes since last sync")
+                    continue
+
+                # Process pages
+                saved_count = 0
+                for search_page in search_results:
+                    try:
+                        full_page = fetcher.get_page_content(
+                            search_page.id, convert_to_markdown=False
+                        )
+                        ancestors = fetcher.get_page_ancestors(search_page.id)
+                        ancestor_ids = [a.id for a in ancestors]
+
+                        check_and_cleanup_moved_page(
+                            space_key, search_page.id, ancestor_ids, existing_metadata
+                        )
+
+                        html_content = full_page.content or ""
+                        version_num = full_page.version.number if full_page.version else None
+                        save_page_html(
+                            space_key=space_key,
+                            page_id=search_page.id,
+                            title=full_page.title,
+                            html_content=html_content,
+                            version=version_num,
+                            url=full_page.url,
+                            ancestors=ancestor_ids,
+                        )
+                        saved_count += 1
+                    except Exception as e:
+                        logger.debug(f"Failed to sync page {search_page.id}: {e}")
+
+                # Cleanup deleted pages on full sync
+                if full_sync:
+                    confluence_page_ids = {p.id for p in search_results}
+                    deleted = cleanup_deleted_pages(space_key, confluence_page_ids, existing_metadata)
+                    if deleted:
+                        logger.debug(f"Space {space_key}: cleaned up {len(deleted)} deleted pages")
+
+                logger.info(f"Auto-sync complete for {space_key}: {saved_count} pages updated")
+
+            except Exception as e:
+                logger.warning(f"Auto-sync failed for space {space_key}: {e}")
+
+    except Exception as e:
+        logger.error(f"Auto-sync initialization failed: {e}")
 
 
 @asynccontextmanager
@@ -42,23 +152,7 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
     read_only = is_read_only_mode()
     enabled_tools = get_enabled_tools()
 
-    loaded_jira_config: JiraConfig | None = None
     loaded_confluence_config: ConfluenceConfig | None = None
-
-    if services.get("jira"):
-        try:
-            jira_config = JiraConfig.from_env()
-            if jira_config.is_auth_configured():
-                loaded_jira_config = jira_config
-                logger.info(
-                    "Jira configuration loaded and authentication is configured."
-                )
-            else:
-                logger.warning(
-                    "Jira URL found, but authentication is not fully configured. Jira tools will be unavailable."
-                )
-        except Exception as e:
-            logger.error(f"Failed to load Jira configuration: {e}", exc_info=True)
 
     if services.get("confluence"):
         try:
@@ -76,13 +170,29 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
             logger.error(f"Failed to load Confluence configuration: {e}", exc_info=True)
 
     app_context = MainAppContext(
-        full_jira_config=loaded_jira_config,
         full_confluence_config=loaded_confluence_config,
         read_only=read_only,
         enabled_tools=enabled_tools,
     )
     logger.info(f"Read-only mode: {'ENABLED' if read_only else 'DISABLED'}")
     logger.info(f"Enabled tools filter: {enabled_tools or 'All tools enabled'}")
+
+    # Ensure .gitignore has our storage directory
+    if is_gitignore_auto_add_enabled():
+        try:
+            ensure_gitignore_entry(auto_add=True)
+        except Exception as e:
+            logger.warning(f"Failed to update .gitignore: {e}")
+
+    # Start auto-sync in background if enabled and configured
+    auto_sync_task: asyncio.Task | None = None
+    if is_auto_sync_enabled() and loaded_confluence_config:
+        synced_spaces = get_all_synced_spaces()
+        if synced_spaces:
+            logger.info(f"Starting background auto-sync for spaces: {synced_spaces}")
+            auto_sync_task = asyncio.create_task(
+                auto_sync_spaces_background(loaded_confluence_config)
+            )
 
     try:
         yield {"app_lifespan_context": app_context}
@@ -91,11 +201,16 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
         raise
     finally:
         logger.info("Main Atlassian MCP server lifespan shutting down...")
+        # Cancel auto-sync task if running
+        if auto_sync_task and not auto_sync_task.done():
+            logger.debug("Cancelling background auto-sync task...")
+            auto_sync_task.cancel()
+            try:
+                await auto_sync_task
+            except asyncio.CancelledError:
+                pass
         # Perform any necessary cleanup here
         try:
-            # Close any open connections if needed
-            if loaded_jira_config:
-                logger.debug("Cleaning up Jira resources...")
             if loaded_confluence_config:
                 logger.debug("Cleaning up Confluence resources...")
         except Exception as e:
@@ -154,22 +269,16 @@ class AtlassianMCP(FastMCP[MainAppContext]):
                 )
                 continue
 
-            # Exclude Jira/Confluence tools if config is not fully authenticated
-            is_jira_tool = "jira" in tool_tags
+            # Exclude Confluence tools if config is not fully authenticated
             is_confluence_tool = "confluence" in tool_tags
             service_configured_and_available = True
             if app_lifespan_state:
-                if is_jira_tool and not app_lifespan_state.full_jira_config:
-                    logger.debug(
-                        f"Excluding Jira tool '{registered_name}' as Jira configuration/authentication is incomplete."
-                    )
-                    service_configured_and_available = False
                 if is_confluence_tool and not app_lifespan_state.full_confluence_config:
                     logger.debug(
                         f"Excluding Confluence tool '{registered_name}' as Confluence configuration/authentication is incomplete."
                     )
                     service_configured_and_available = False
-            elif is_jira_tool or is_confluence_tool:
+            elif is_confluence_tool:
                 logger.warning(
                     f"Excluding tool '{registered_name}' as application context is unavailable to verify service configuration."
                 )
@@ -185,154 +294,6 @@ class AtlassianMCP(FastMCP[MainAppContext]):
         )
         return filtered_tools
 
-    def http_app(
-        self,
-        path: str | None = None,
-        middleware: list[Middleware] | None = None,
-        transport: Literal["streamable-http", "sse"] = "streamable-http",
-    ) -> "Starlette":
-        user_token_mw = Middleware(UserTokenMiddleware, mcp_server_ref=self)
-        final_middleware_list = [user_token_mw]
-        if middleware:
-            final_middleware_list.extend(middleware)
-        app = super().http_app(
-            path=path, middleware=final_middleware_list, transport=transport
-        )
-        return app
-
-
-token_validation_cache: TTLCache[
-    int, tuple[bool, str | None, JiraFetcher | None, ConfluenceFetcher | None]
-] = TTLCache(maxsize=100, ttl=300)
-
-
-class UserTokenMiddleware(BaseHTTPMiddleware):
-    """Middleware to extract Atlassian user tokens/credentials from Authorization headers."""
-
-    def __init__(
-        self, app: Any, mcp_server_ref: Optional["AtlassianMCP"] = None
-    ) -> None:
-        super().__init__(app)
-        self.mcp_server_ref = mcp_server_ref
-        if not self.mcp_server_ref:
-            logger.warning(
-                "UserTokenMiddleware initialized without mcp_server_ref. Path matching for MCP endpoint might fail if settings are needed."
-            )
-
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> JSONResponse:
-        logger.debug(
-            f"UserTokenMiddleware.dispatch: ENTERED for request path='{request.url.path}', method='{request.method}'"
-        )
-        mcp_server_instance = self.mcp_server_ref
-        if mcp_server_instance is None:
-            logger.debug(
-                "UserTokenMiddleware.dispatch: self.mcp_server_ref is None. Skipping MCP auth logic."
-            )
-            return await call_next(request)
-
-        mcp_path = mcp_server_instance.settings.streamable_http_path.rstrip("/")
-        request_path = request.url.path.rstrip("/")
-        logger.debug(
-            f"UserTokenMiddleware.dispatch: Comparing request_path='{request_path}' with mcp_path='{mcp_path}'. Request method='{request.method}'"
-        )
-        if request_path == mcp_path and request.method == "POST":
-            auth_header = request.headers.get("Authorization")
-            cloud_id_header = request.headers.get("X-Atlassian-Cloud-Id")
-
-            token_for_log = mask_sensitive(
-                auth_header.split(" ", 1)[1].strip()
-                if auth_header and " " in auth_header
-                else auth_header
-            )
-            logger.debug(
-                f"UserTokenMiddleware: Path='{request.url.path}', AuthHeader='{mask_sensitive(auth_header)}', ParsedToken(masked)='{token_for_log}', CloudId='{cloud_id_header}'"
-            )
-
-            # Extract and save cloudId if provided
-            if cloud_id_header and cloud_id_header.strip():
-                request.state.user_atlassian_cloud_id = cloud_id_header.strip()
-                logger.debug(
-                    f"UserTokenMiddleware: Extracted cloudId from header: {cloud_id_header.strip()}"
-                )
-            else:
-                request.state.user_atlassian_cloud_id = None
-                logger.debug(
-                    "UserTokenMiddleware: No cloudId header provided, will use global config"
-                )
-
-            # Check for mcp-session-id header for debugging
-            mcp_session_id = request.headers.get("mcp-session-id")
-            if mcp_session_id:
-                logger.debug(
-                    f"UserTokenMiddleware: MCP-Session-ID header found: {mcp_session_id}"
-                )
-            if auth_header and auth_header.startswith("Bearer "):
-                token = auth_header.split(" ", 1)[1].strip()
-                if not token:
-                    return JSONResponse(
-                        {"error": "Unauthorized: Empty Bearer token"},
-                        status_code=401,
-                    )
-                logger.debug(
-                    f"UserTokenMiddleware.dispatch: Bearer token extracted (masked): ...{mask_sensitive(token, 8)}"
-                )
-                request.state.user_atlassian_token = token
-                request.state.user_atlassian_auth_type = "oauth"
-                request.state.user_atlassian_email = None
-                logger.debug(
-                    f"UserTokenMiddleware.dispatch: Set request.state (pre-validation): "
-                    f"auth_type='{getattr(request.state, 'user_atlassian_auth_type', 'N/A')}', "
-                    f"token_present={bool(getattr(request.state, 'user_atlassian_token', None))}"
-                )
-            elif auth_header and auth_header.startswith("Token "):
-                token = auth_header.split(" ", 1)[1].strip()
-                if not token:
-                    return JSONResponse(
-                        {"error": "Unauthorized: Empty Token (PAT)"},
-                        status_code=401,
-                    )
-                logger.debug(
-                    f"UserTokenMiddleware.dispatch: PAT (Token scheme) extracted (masked): ...{mask_sensitive(token, 8)}"
-                )
-                request.state.user_atlassian_token = token
-                request.state.user_atlassian_auth_type = "pat"
-                request.state.user_atlassian_email = (
-                    None  # PATs don't carry email in the token itself
-                )
-                logger.debug(
-                    "UserTokenMiddleware.dispatch: Set request.state for PAT auth."
-                )
-            elif auth_header:
-                logger.warning(
-                    f"Unsupported Authorization type for {request.url.path}: {auth_header.split(' ', 1)[0] if ' ' in auth_header else 'UnknownType'}"
-                )
-                return JSONResponse(
-                    {
-                        "error": "Unauthorized: Only 'Bearer <OAuthToken>' or 'Token <PAT>' types are supported."
-                    },
-                    status_code=401,
-                )
-            else:
-                logger.debug(
-                    f"No Authorization header provided for {request.url.path}. Will proceed with global/fallback server configuration if applicable."
-                )
-        response = await call_next(request)
-        logger.debug(
-            f"UserTokenMiddleware.dispatch: EXITED for request path='{request.url.path}'"
-        )
-        return response
-
 
 main_mcp = AtlassianMCP(name="Atlassian MCP", lifespan=main_lifespan)
-main_mcp.mount("jira", jira_mcp)
 main_mcp.mount("confluence", confluence_mcp)
-
-
-@main_mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
-async def _health_check_route(request: Request) -> JSONResponse:
-    return await health_check(request)
-
-
-logger.info("Added /healthz endpoint for Kubernetes probes")

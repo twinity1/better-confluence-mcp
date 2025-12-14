@@ -1,7 +1,6 @@
 #!/bin/bash
 
-# Unified script for testing with real Atlassian data
-# Supports testing models, API, or both
+# Script for testing Better Confluence MCP with real Confluence data
 
 # Default settings
 TEST_TYPE="all"  # Can be "all", "models", or "api"
@@ -49,7 +48,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --all                  Test both models and API (default)"
       echo "  --quiet                Minimal output"
       echo "  --verbose              More detailed output"
-      echo "  --with-write-tests     Include tests that modify data (including TextContent validation)"
+      echo "  --with-write-tests     Include tests that modify data"
       echo "  -k \"PATTERN\"         Only run tests matching the given pattern (uses pytest's -k option)"
       echo "  --help                 Show this help message"
       exit 0
@@ -74,18 +73,11 @@ fi
 export USE_REAL_DATA=true
 
 # Set specific test IDs for API validation tests
-# These will be used if they're set, otherwise tests will be skipped
-export JIRA_TEST_ISSUE_KEY="${JIRA_TEST_ISSUE_KEY:-}"
-export JIRA_TEST_EPIC_KEY="${JIRA_TEST_EPIC_KEY:-}"
 export CONFLUENCE_TEST_PAGE_ID="${CONFLUENCE_TEST_PAGE_ID:-}"
-export JIRA_TEST_PROJECT_KEY="${JIRA_TEST_PROJECT_KEY:-}"
 export CONFLUENCE_TEST_SPACE_KEY="${CONFLUENCE_TEST_SPACE_KEY:-}"
 
 # Check required environment variables and warn if any are missing
 required_vars=(
-    "JIRA_URL"
-    "JIRA_USERNAME"
-    "JIRA_API_TOKEN"
     "CONFLUENCE_URL"
     "CONFLUENCE_USERNAME"
     "CONFLUENCE_API_TOKEN"
@@ -113,10 +105,6 @@ run_model_tests() {
     uv run pytest tests/unit/models/test_base_models.py $VERBOSITY
 
     echo ""
-    echo "===== Jira Model Tests ====="
-    uv run pytest tests/unit/models/test_jira_models.py::TestRealJiraData $VERBOSITY
-
-    echo ""
     echo "===== Confluence Model Tests ====="
     uv run pytest tests/unit/models/test_confluence_models.py::TestRealConfluenceData $VERBOSITY
 }
@@ -133,25 +121,18 @@ run_api_tests() {
         return
     fi
 
-    # Otherwise run specific tests based on write/read only setting
     # Run the read-only tests
-    uv run pytest tests/test_real_api_validation.py::test_jira_get_issue tests/test_real_api_validation.py::test_jira_get_issue_with_fields tests/test_real_api_validation.py::test_jira_get_epic_issues tests/test_real_api_validation.py::test_confluence_get_page_content $VERBOSITY
+    uv run pytest tests/test_real_api_validation.py::test_confluence_get_page_content $VERBOSITY
 
     if [[ "$RUN_WRITE_TESTS" == "true" ]]; then
         echo ""
         echo "===== API Write Operation Tests ====="
-        echo "WARNING: These tests will create and modify data in your Atlassian instance."
+        echo "WARNING: These tests will create and modify data in your Confluence instance."
         echo "Press Ctrl+C now to cancel, or wait 5 seconds to continue..."
         sleep 5
 
         # Run the write operation tests
-        uv run pytest tests/test_real_api_validation.py::test_jira_create_issue tests/test_real_api_validation.py::test_jira_create_subtask tests/test_real_api_validation.py::test_jira_create_task_with_parent tests/test_real_api_validation.py::test_jira_add_comment tests/test_real_api_validation.py::test_confluence_create_page tests/test_real_api_validation.py::test_confluence_update_page tests/test_real_api_validation.py::test_jira_create_epic tests/test_real_api_validation.py::test_jira_create_epic_two_step $VERBOSITY
-
-        # Run the skipped transition test if explicitly requested write tests
-        echo ""
-        echo "===== API Advanced Write Tests ====="
-        echo "Running tests for status transitions"
-        uv run pytest tests/test_real_api_validation.py::test_jira_transition_issue -v -k "test_jira_transition_issue"
+        uv run pytest tests/test_real_api_validation.py::test_confluence_create_page tests/test_real_api_validation.py::test_confluence_update_page $VERBOSITY
     fi
 }
 

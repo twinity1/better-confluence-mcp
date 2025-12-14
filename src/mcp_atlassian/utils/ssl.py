@@ -79,7 +79,7 @@ def configure_ssl_verification(
     service's domain.
 
     Args:
-        service_name: Name of the service for logging (e.g., "Confluence", "Jira")
+        service_name: Name of the service for logging (e.g., "Confluence")
         url: The base URL of the service
         session: The requests session to configure
         ssl_verify: Whether SSL verification should be enabled

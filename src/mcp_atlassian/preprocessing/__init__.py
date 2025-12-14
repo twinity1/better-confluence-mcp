@@ -5,11 +5,9 @@
 from .base import BasePreprocessor
 from .base import BasePreprocessor as TextPreprocessor
 from .confluence import ConfluencePreprocessor
-from .jira import JiraPreprocessor
 
 __all__ = [
     "BasePreprocessor",
     "ConfluencePreprocessor",
-    "JiraPreprocessor",
     "TextPreprocessor",  # For backwards compatibility
 ]

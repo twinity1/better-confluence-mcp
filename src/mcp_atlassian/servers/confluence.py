@@ -2,23 +2,735 @@
 
 import json
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated
 
 from fastmcp import Context, FastMCP
-from pydantic import BeforeValidator, Field
+from pydantic import Field
 
-from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
-from mcp_atlassian.servers.dependencies import get_confluence_fetcher
-from mcp_atlassian.utils.decorators import (
-    check_write_access,
+from mcp_atlassian.local_storage import (
+    check_and_cleanup_moved_page,
+    cleanup_deleted_pages,
+    ensure_attachments_folder,
+    get_page_info,
+    load_space_metadata,
+    merge_into_metadata,
+    remove_pages_from_metadata,
+    save_page_html,
+    save_space_metadata,
 )
+from mcp_atlassian.servers.dependencies import get_confluence_fetcher
+from mcp_atlassian.utils.decorators import check_write_access
 
 logger = logging.getLogger(__name__)
 
 confluence_mcp = FastMCP(
     name="Confluence MCP Service",
-    description="Provides tools for interacting with Atlassian Confluence.",
+    description="Provides tools for syncing and editing Confluence spaces locally.",
 )
+
+
+# =============================================================================
+# TOOLS - Local Space Sync & Update
+# =============================================================================
+
+
+# Auto full sync interval (3 days)
+AUTO_FULL_SYNC_DAYS = 3
+
+
+@confluence_mcp.tool(tags={"confluence", "sync"})
+async def sync_space(
+    ctx: Context,
+    space_key: Annotated[
+        str,
+        Field(
+            description="The key of the Confluence space to sync (e.g., 'DEV', 'TEAM', 'IT')"
+        ),
+    ],
+    full_sync: Annotated[
+        bool,
+        Field(
+            description="Force full sync instead of incremental. Default is False (incremental).",
+            default=False,
+        ),
+    ] = False,
+) -> str:
+    """Sync a Confluence space to local filesystem.
+
+    Downloads pages from the specified space and stores them as formatted HTML
+    in a tree structure under .better-confluence-mcp/SPACE_KEY/.
+
+    By default, performs incremental sync - only fetches pages modified since
+    the last sync. Use full_sync=True to re-download everything.
+
+    NOTE: This operation can take a while depending on the size of the space
+    and internet connection speed. A full sync of a large space (100+ pages)
+    may take several minutes.
+
+    Auto full sync: If the last sync was more than 3 days ago, a full sync
+    is automatically triggered to detect deleted pages.
+
+    The folder structure mirrors the page hierarchy:
+    - .better-confluence-mcp/SPACE_KEY/page_id/content.html
+    - .better-confluence-mcp/SPACE_KEY/page_id/child_page_id/content.html
+
+    After syncing, the agent can read and edit these HTML files directly using
+    standard file tools, then use push_page_update to push changes.
+
+    Args:
+        ctx: The FastMCP context.
+        space_key: The key of the space to sync.
+        full_sync: If True, sync all pages. If False, only sync pages modified since last sync.
+
+    Returns:
+        JSON string with sync results.
+    """
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    logger.info(f"Starting sync for space: {space_key} (full_sync={full_sync})")
+
+    try:
+        # Load existing metadata to get last sync time
+        existing_metadata = load_space_metadata(space_key)
+        last_sync_time = None
+        auto_full_sync_triggered = False
+
+        if not full_sync and existing_metadata:
+            # Check if last sync was more than AUTO_FULL_SYNC_DAYS ago
+            try:
+                last_dt = datetime.fromisoformat(
+                    existing_metadata.last_synced.replace("Z", "+00:00")
+                )
+                days_since_sync = (datetime.now(timezone.utc) - last_dt).days
+                if days_since_sync >= AUTO_FULL_SYNC_DAYS:
+                    logger.info(
+                        f"Last sync was {days_since_sync} days ago, triggering auto full sync"
+                    )
+                    full_sync = True
+                    auto_full_sync_triggered = True
+            except (ValueError, AttributeError) as e:
+                logger.warning(f"Could not parse last sync time: {e}")
+
+        if not full_sync and existing_metadata:
+            last_sync_time = existing_metadata.last_synced
+            logger.info(f"Incremental sync from: {last_sync_time}")
+
+        # Build CQL query
+        cql_base = f'type=page AND space.key="{space_key}"'
+
+        if last_sync_time:
+            # Parse ISO format and convert to CQL date format
+            try:
+                last_dt = datetime.fromisoformat(last_sync_time.replace("Z", "+00:00"))
+                last_sync_date_str = last_dt.strftime("%Y-%m-%d %H:%M")
+                cql_query = f'{cql_base} AND lastModified >= "{last_sync_date_str}"'
+            except ValueError:
+                logger.warning(f"Could not parse last sync time: {last_sync_time}, doing full sync")
+                cql_query = cql_base
+        else:
+            cql_query = cql_base
+
+        logger.info(f"Using CQL: {cql_query}")
+
+        # Search for pages (this returns page IDs and basic info)
+        search_results = confluence_fetcher.search(cql_query, limit=500)
+
+        if not search_results and not existing_metadata:
+            return json.dumps(
+                {"error": f"No pages found in space '{space_key}' or space does not exist."},
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        if not search_results:
+            return json.dumps(
+                {
+                    "success": True,
+                    "space_key": space_key,
+                    "message": "No pages modified since last sync.",
+                    "total_pages_in_cache": existing_metadata.total_pages if existing_metadata else 0,
+                    "last_synced": existing_metadata.last_synced if existing_metadata else None,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        # Get space name
+        space_name = space_key
+        if search_results and search_results[0].space:
+            space_name = search_results[0].space.name or space_key
+
+        # Process each page: get full content and ancestors
+        saved_pages: list[dict] = []
+        moved_pages: list[str] = []
+        errors: list[str] = []
+
+        for search_page in search_results:
+            page_id = search_page.id
+            try:
+                # Get full page content (as HTML)
+                full_page = confluence_fetcher.get_page_content(
+                    page_id, convert_to_markdown=False
+                )
+
+                # Get ancestors for tree structure
+                ancestors = confluence_fetcher.get_page_ancestors(page_id)
+                ancestor_ids = [a.id for a in ancestors]  # Root first, parent last
+
+                # Check if page has moved and cleanup old location
+                if check_and_cleanup_moved_page(
+                    space_key, page_id, ancestor_ids, existing_metadata
+                ):
+                    moved_pages.append(page_id)
+
+                # Save the page
+                html_content = full_page.content or ""
+                version_num = full_page.version.number if full_page.version else None
+                file_path = save_page_html(
+                    space_key=space_key,
+                    page_id=page_id,
+                    title=full_page.title,
+                    html_content=html_content,
+                    version=version_num,
+                    url=full_page.url,
+                    ancestors=ancestor_ids,
+                )
+
+                saved_pages.append({
+                    "page_id": page_id,
+                    "title": full_page.title,
+                    "version": version_num,
+                    "url": full_page.url,
+                    "path": file_path,
+                    "ancestors": ancestor_ids,
+                    "last_synced": datetime.now(timezone.utc).isoformat(),
+                })
+
+                logger.debug(f"Saved page: {full_page.title} ({page_id})")
+
+            except Exception as e:
+                error_msg = f"Failed to sync page {page_id}: {e}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+
+        # For full sync, cleanup pages that were deleted from Confluence
+        deleted_pages: list[str] = []
+        if full_sync and existing_metadata:
+            confluence_page_ids = {p.id for p in search_results}
+            deleted_pages = cleanup_deleted_pages(
+                space_key, confluence_page_ids, existing_metadata
+            )
+
+        # Merge into metadata
+        new_metadata = merge_into_metadata(
+            existing=existing_metadata,
+            new_pages=saved_pages,
+            space_key=space_key,
+            space_name=space_name,
+        )
+
+        # Remove deleted pages from metadata
+        if deleted_pages:
+            new_metadata = remove_pages_from_metadata(new_metadata, deleted_pages)
+
+        save_space_metadata(new_metadata)
+
+        # Limit displayed pages to 50
+        max_display = 50
+        display_pages = [
+            {"page_id": p["page_id"], "title": p["title"], "path": p["path"]}
+            for p in saved_pages[:max_display]
+        ]
+
+        # Determine sync type for response
+        if auto_full_sync_triggered:
+            sync_type = "auto_full"
+        elif full_sync or not existing_metadata:
+            sync_type = "full"
+        else:
+            sync_type = "incremental"
+
+        result = {
+            "success": True,
+            "space_key": space_key,
+            "space_name": space_name,
+            "sync_type": sync_type,
+            "pages_synced": len(saved_pages),
+            "total_pages_in_cache": new_metadata.total_pages,
+            "last_synced": new_metadata.last_synced,
+            "storage_path": f".better-confluence-mcp/{space_key}/",
+            "synced_pages": display_pages,
+        }
+
+        if auto_full_sync_triggered:
+            result["auto_full_sync_reason"] = (
+                f"Last sync was more than {AUTO_FULL_SYNC_DAYS} days ago"
+            )
+
+        if len(saved_pages) > max_display:
+            result["synced_pages_truncated"] = True
+            result["synced_pages_message"] = f"Showing first {max_display} of {len(saved_pages)} synced pages"
+
+        if moved_pages:
+            result["pages_moved"] = len(moved_pages)
+            result["moved_page_ids"] = moved_pages
+
+        if deleted_pages:
+            result["pages_deleted"] = len(deleted_pages)
+            result["deleted_page_ids"] = deleted_pages
+
+        if errors:
+            result["errors"] = errors
+
+        logger.info(
+            f"Sync complete for space {space_key}: "
+            f"{len(saved_pages)} synced, {len(moved_pages)} moved, {len(deleted_pages)} deleted"
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        logger.error(f"Sync failed for space {space_key}: {e}")
+        return json.dumps(
+            {"error": f"Failed to sync space '{space_key}': {str(e)}"},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+@confluence_mcp.tool(tags={"confluence", "read"})
+async def read_page(
+    ctx: Context,
+    page_id: Annotated[
+        str,
+        Field(description="The ID of the page to read"),
+    ],
+) -> str:
+    """Read a page from Confluence by syncing its entire space first.
+
+    This tool syncs the entire space containing the page (incremental sync),
+    then returns metadata for the specific requested page. This ensures the
+    full context of the space is available locally.
+
+    The agent can then use standard file tools to read and edit the HTML file.
+    After editing, use push_page_update to push changes back to Confluence.
+
+    Args:
+        ctx: The FastMCP context.
+        page_id: The ID of the page to read.
+
+    Returns:
+        JSON string with page metadata and local path, or error if not found.
+    """
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    try:
+        # First, try to get the page to find its space
+        target_page = None
+        page_exists_in_confluence = True
+        space_key = None
+        space_name = None
+
+        try:
+            target_page = confluence_fetcher.get_page_content(
+                page_id, convert_to_markdown=False
+            )
+            if target_page:
+                space_key = target_page.space.key if target_page.space else None
+                space_name = target_page.space.name if target_page.space else space_key
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not found" in error_str.lower():
+                page_exists_in_confluence = False
+            else:
+                raise
+
+        # If page not found in Confluence, check local storage to find the space
+        if not target_page or not space_key:
+            page_exists_in_confluence = False
+            local_page_info = get_page_info(page_id)
+            if local_page_info:
+                space_key = local_page_info.get("space_key")
+                logger.info(f"Page {page_id} not in Confluence, but found locally in space {space_key}")
+            else:
+                return json.dumps(
+                    {"error": f"Page '{page_id}' does not exist in Confluence or local storage."},
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+        logger.info(f"Syncing space '{space_key}' to read page {page_id}")
+
+        # Load existing metadata to check for incremental sync
+        existing_metadata = load_space_metadata(space_key)
+        full_sync = False
+
+        # Check if we need full sync (more than AUTO_FULL_SYNC_DAYS old)
+        if existing_metadata:
+            try:
+                last_dt = datetime.fromisoformat(
+                    existing_metadata.last_synced.replace("Z", "+00:00")
+                )
+                days_since_sync = (datetime.now(timezone.utc) - last_dt).days
+                if days_since_sync >= AUTO_FULL_SYNC_DAYS:
+                    full_sync = True
+                    logger.info(f"Last sync was {days_since_sync} days ago, triggering full sync")
+            except (ValueError, AttributeError):
+                pass
+
+        # Build CQL query for the space
+        cql_base = f'type=page AND space.key="{space_key}"'
+
+        if not full_sync and existing_metadata:
+            try:
+                last_dt = datetime.fromisoformat(
+                    existing_metadata.last_synced.replace("Z", "+00:00")
+                )
+                last_sync_date_str = last_dt.strftime("%Y-%m-%d %H:%M")
+                cql_query = f'{cql_base} AND lastModified >= "{last_sync_date_str}"'
+            except ValueError:
+                cql_query = cql_base
+        else:
+            cql_query = cql_base
+
+        # Search for pages in the space
+        search_results = confluence_fetcher.search(cql_query, limit=500)
+
+        # Process pages
+        saved_pages: list[dict] = []
+        target_page_data: dict | None = None
+
+        for search_page in search_results or []:
+            try:
+                full_page = confluence_fetcher.get_page_content(
+                    search_page.id, convert_to_markdown=False
+                )
+                ancestors = confluence_fetcher.get_page_ancestors(search_page.id)
+                ancestor_ids = [a.id for a in ancestors]
+
+                # Check for moved pages
+                check_and_cleanup_moved_page(
+                    space_key, search_page.id, ancestor_ids, existing_metadata
+                )
+
+                html_content = full_page.content or ""
+                version_num = full_page.version.number if full_page.version else None
+                file_path = save_page_html(
+                    space_key=space_key,
+                    page_id=search_page.id,
+                    title=full_page.title,
+                    html_content=html_content,
+                    version=version_num,
+                    url=full_page.url,
+                    ancestors=ancestor_ids,
+                )
+
+                page_data = {
+                    "page_id": search_page.id,
+                    "title": full_page.title,
+                    "version": version_num,
+                    "url": full_page.url,
+                    "path": file_path,
+                    "ancestors": ancestor_ids,
+                    "last_synced": datetime.now(timezone.utc).isoformat(),
+                }
+                saved_pages.append(page_data)
+
+                # Track the target page
+                if search_page.id == page_id:
+                    target_page_data = page_data
+
+            except Exception as e:
+                logger.debug(f"Failed to sync page {search_page.id}: {e}")
+
+        # Cleanup deleted pages on full sync
+        deleted_pages: list[str] = []
+        if full_sync and existing_metadata and search_results:
+            confluence_page_ids = {p.id for p in search_results}
+            deleted_pages = cleanup_deleted_pages(
+                space_key, confluence_page_ids, existing_metadata
+            )
+
+        # Merge into metadata
+        new_metadata = merge_into_metadata(
+            existing=existing_metadata,
+            new_pages=saved_pages,
+            space_key=space_key,
+            space_name=space_name,
+        )
+
+        if deleted_pages:
+            new_metadata = remove_pages_from_metadata(new_metadata, deleted_pages)
+
+        save_space_metadata(new_metadata)
+
+        # If target page wasn't in search results (not modified), get from metadata
+        if not target_page_data and page_id in new_metadata.page_index:
+            idx = new_metadata.page_index[page_id]
+            target_page_data = {
+                "page_id": page_id,
+                "title": idx["title"],
+                "version": idx["version"],
+                "url": idx["url"],
+                "path": idx["path"],
+                "ancestors": idx.get("ancestors", []),
+                "last_synced": idx["last_synced"],
+            }
+
+        # Handle case where page was deleted from Confluence
+        if not page_exists_in_confluence or not target_page_data:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Page '{page_id}' does not exist in Confluence.",
+                    "page_id": page_id,
+                    "space_key": space_key,
+                    "space_synced": True,
+                    "pages_synced": len(saved_pages),
+                    "total_pages_in_space": new_metadata.total_pages,
+                    "message": "The space was synced successfully, but the requested page was not found.",
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        result = {
+            "success": True,
+            "page_id": page_id,
+            "title": target_page_data["title"],
+            "space_key": space_key,
+            "space_name": space_name,
+            "version": target_page_data["version"],
+            "url": target_page_data["url"],
+            "local_path": target_page_data["path"],
+            "ancestors": target_page_data["ancestors"],
+            "last_synced": target_page_data["last_synced"],
+            "space_synced": True,
+            "pages_synced": len(saved_pages),
+            "total_pages_in_space": new_metadata.total_pages,
+        }
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        error_str = str(e)
+        if "404" in error_str or "not found" in error_str.lower():
+            return json.dumps(
+                {"error": f"Page '{page_id}' does not exist in Confluence."},
+                indent=2,
+                ensure_ascii=False,
+            )
+        logger.error(f"Failed to read page {page_id}: {e}")
+        return json.dumps(
+            {"error": f"Failed to read page: {error_str}"},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+@confluence_mcp.tool(tags={"confluence", "write"})
+@check_write_access
+async def push_page_update(
+    ctx: Context,
+    page_id: Annotated[
+        str,
+        Field(description="The ID of the page to update"),
+    ],
+    revision_message: Annotated[
+        str,
+        Field(description="A message describing the changes (like a commit message)"),
+    ],
+) -> str:
+    """Push local HTML changes to Confluence.
+
+    The agent should:
+    1. Read the local HTML file (find path in _metadata.json or use the tree structure)
+    2. Make edits to the HTML content
+    3. Call this tool with the page_id and revision_message
+
+    The tool will read the current content from the local file and push it to Confluence.
+    Before updating, it verifies the local version matches Confluence. If someone else
+    edited the page, the local copy is re-synced and an error is returned.
+
+    Args:
+        ctx: The FastMCP context.
+        page_id: The ID of the page to update.
+        revision_message: Description of the changes (shown in Confluence page history).
+
+    Returns:
+        JSON string indicating success or failure.
+    """
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # Find the page in local storage
+    page_info = get_page_info(page_id)
+
+    if not page_info:
+        return json.dumps(
+            {
+                "error": f"Page '{page_id}' not found in local storage.",
+                "hint": "Use sync_space to sync the space first, then edit the HTML file and call this tool.",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    # Read the local HTML file
+    file_path = Path.cwd() / page_info["path"]
+    if not file_path.exists():
+        return json.dumps(
+            {
+                "error": f"Local file not found: {page_info['path']}",
+                "hint": "The file may have been deleted. Re-sync the space.",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    space_key = page_info["space_key"]
+    local_version = page_info.get("version")
+
+    # Check if local version matches Confluence version before updating
+    try:
+        current_page = confluence_fetcher.get_page_content(
+            page_id, convert_to_markdown=False
+        )
+        confluence_version = current_page.version.number if current_page.version else None
+
+        if local_version is not None and confluence_version is not None:
+            if local_version != confluence_version:
+                # Version mismatch - re-sync the page and return error
+                logger.warning(
+                    f"Version mismatch for page {page_id}: local={local_version}, confluence={confluence_version}"
+                )
+
+                # Get ancestors for tree structure
+                ancestors = confluence_fetcher.get_page_ancestors(page_id)
+                ancestor_ids = [a.id for a in ancestors]
+
+                # Re-sync the page with latest content
+                html_content = current_page.content or ""
+                new_path = save_page_html(
+                    space_key=space_key,
+                    page_id=page_id,
+                    title=current_page.title,
+                    html_content=html_content,
+                    version=confluence_version,
+                    url=current_page.url,
+                    ancestors=ancestor_ids,
+                )
+
+                # Update metadata
+                existing_metadata = load_space_metadata(space_key)
+                if existing_metadata:
+                    existing_metadata.page_index[page_id] = {
+                        "title": current_page.title,
+                        "version": confluence_version,
+                        "url": current_page.url,
+                        "path": new_path,
+                        "ancestors": ancestor_ids,
+                        "last_synced": datetime.now(timezone.utc).isoformat(),
+                    }
+                    save_space_metadata(existing_metadata)
+
+                return json.dumps(
+                    {
+                        "error": "Page was modified externally",
+                        "message": (
+                            f"The page was edited in Confluence (version {confluence_version}) "
+                            f"since your last sync (version {local_version}). "
+                            "The page has been re-synced with the latest content. "
+                            "Please review the changes, make your edits again, and call push_page_update."
+                        ),
+                        "local_path": new_path,
+                        "local_version": local_version,
+                        "confluence_version": confluence_version,
+                        "page_id": page_id,
+                        "title": current_page.title,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+
+    except Exception as e:
+        logger.warning(f"Could not verify page version before update: {e}")
+        # Continue with update attempt - let it fail naturally if there's a real issue
+
+    with open(file_path, encoding="utf-8") as f:
+        content = f.read()
+
+    # Strip the metadata comment header
+    if content.startswith("<!--"):
+        end_comment = content.find("-->")
+        if end_comment != -1:
+            content = content[end_comment + 3:].lstrip("\n")
+
+    try:
+        # Update the page in Confluence using storage format (HTML)
+        updated_page = confluence_fetcher.update_page(
+            page_id=page_id,
+            title=page_info["title"],
+            body=content,
+            is_minor_edit=False,
+            version_comment=revision_message,
+            is_markdown=False,
+            content_representation="storage",
+        )
+
+        # Update local storage with new version
+        ancestors = page_info.get("ancestors", [])
+        version_num = updated_page.version.number if updated_page.version else None
+        new_path = save_page_html(
+            space_key=space_key,
+            page_id=page_id,
+            title=updated_page.title,
+            html_content=content,
+            version=version_num,
+            url=updated_page.url,
+            ancestors=ancestors,
+        )
+
+        # Update metadata
+        existing_metadata = load_space_metadata(space_key)
+        if existing_metadata:
+            existing_metadata.page_index[page_id] = {
+                "title": updated_page.title,
+                "version": version_num,
+                "url": updated_page.url,
+                "path": new_path,
+                "ancestors": ancestors,
+                "last_synced": datetime.now(timezone.utc).isoformat(),
+            }
+            existing_metadata.last_synced = datetime.now(timezone.utc).isoformat()
+            save_space_metadata(existing_metadata)
+
+        result = {
+            "success": True,
+            "message": "Page updated successfully",
+            "page_id": page_id,
+            "title": updated_page.title,
+            "new_version": version_num,
+            "url": updated_page.url,
+            "revision_message": revision_message,
+        }
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        logger.error(f"Failed to update page {page_id}: {e}")
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Failed to update page: {str(e)}",
+                "page_id": page_id,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+# =============================================================================
+# TOOLS - Search, Spaces, Comments, Users
+# =============================================================================
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
@@ -27,46 +739,17 @@ async def search(
     query: Annotated[
         str,
         Field(
-            description=(
-                "Search query - can be either a simple text (e.g. 'project documentation') or a CQL query string. "
-                "Simple queries use 'siteSearch' by default, to mimic the WebUI search, with an automatic fallback "
-                "to 'text' search if not supported. Examples of CQL:\n"
-                "- Basic search: 'type=page AND space=DEV'\n"
-                "- Personal space search: 'space=\"~username\"' (note: personal space keys starting with ~ must be quoted)\n"
-                "- Search by title: 'title~\"Meeting Notes\"'\n"
-                "- Use siteSearch: 'siteSearch ~ \"important concept\"'\n"
-                "- Use text search: 'text ~ \"important concept\"'\n"
-                "- Recent content: 'created >= \"2023-01-01\"'\n"
-                "- Content with specific label: 'label=documentation'\n"
-                "- Recently modified content: 'lastModified > startOfMonth(\"-1M\")'\n"
-                "- Content modified this year: 'creator = currentUser() AND lastModified > startOfYear()'\n"
-                "- Content you contributed to recently: 'contributor = currentUser() AND lastModified > startOfWeek()'\n"
-                "- Content watched by user: 'watcher = \"user@domain.com\" AND type = page'\n"
-                '- Exact phrase in content: \'text ~ "\\"Urgent Review Required\\"" AND label = "pending-approval"\'\n'
-                '- Title wildcards: \'title ~ "Minutes*" AND (space = "HR" OR space = "Marketing")\'\n'
-                'Note: Special identifiers need proper quoting in CQL: personal space keys (e.g., "~username"), '
-                "reserved words, numeric IDs, and identifiers with special characters."
-            )
+            description="Search query - can be simple text or CQL. Examples: 'project documentation', 'type=page AND space=DEV', 'title~\"Meeting Notes\"'"
         ),
     ],
     limit: Annotated[
         int,
-        Field(
-            description="Maximum number of results (1-50)",
-            default=10,
-            ge=1,
-            le=50,
-        ),
+        Field(description="Maximum number of results (1-50)", ge=1, le=50, default=10),
     ] = 10,
     spaces_filter: Annotated[
         str | None,
         Field(
-            description=(
-                "(Optional) Comma-separated list of space keys to filter results by. "
-                "Overrides the environment variable CONFLUENCE_SPACES_FILTER if provided. "
-                "Use empty string to disable filtering."
-            ),
-            default=None,
+            description="Comma-separated list of space keys to filter by (e.g., 'DEV,QA')"
         ),
     ] = None,
 ) -> str:
@@ -76,242 +759,93 @@ async def search(
         ctx: The FastMCP context.
         query: Search query - can be simple text or a CQL query string.
         limit: Maximum number of results (1-50).
-        spaces_filter: Comma-separated list of space keys to filter by.
+        spaces_filter: Optional comma-separated list of space keys to filter by.
 
     Returns:
-        JSON string representing a list of simplified Confluence page objects.
+        JSON string with search results.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
-    # Check if the query is a simple search term or already a CQL query
-    if query and not any(
-        x in query for x in ["=", "~", ">", "<", " AND ", " OR ", "currentUser()"]
-    ):
-        original_query = query
-        try:
-            query = f'siteSearch ~ "{original_query}"'
-            logger.info(
-                f"Converting simple search term to CQL using siteSearch: {query}"
-            )
-            pages = confluence_fetcher.search(
-                query, limit=limit, spaces_filter=spaces_filter
-            )
-        except Exception as e:
-            logger.warning(f"siteSearch failed ('{e}'), falling back to text search.")
-            query = f'text ~ "{original_query}"'
-            logger.info(f"Falling back to text search with CQL: {query}")
-            pages = confluence_fetcher.search(
-                query, limit=limit, spaces_filter=spaces_filter
-            )
-    else:
-        pages = confluence_fetcher.search(
-            query, limit=limit, spaces_filter=spaces_filter
-        )
-    search_results = [page.to_simplified_dict() for page in pages]
-    return json.dumps(search_results, indent=2, ensure_ascii=False)
 
+    try:
+        # If query doesn't look like CQL, wrap it in a text search
+        if not any(op in query for op in ["=", "~", ">", "<", " AND ", " OR "]):
+            cql_query = f'text ~ "{query}"'
+        else:
+            cql_query = query
 
-@confluence_mcp.tool(tags={"confluence", "read"})
-async def get_page(
-    ctx: Context,
-    page_id: Annotated[
-        str | None,
-        Field(
-            description=(
-                "Confluence page ID (numeric ID, can be found in the page URL). "
-                "For example, in the URL 'https://example.atlassian.net/wiki/spaces/TEAM/pages/123456789/Page+Title', "
-                "the page ID is '123456789'. "
-                "Provide this OR both 'title' and 'space_key'. If page_id is provided, title and space_key will be ignored."
-            ),
-            default=None,
-        ),
-    ] = None,
-    title: Annotated[
-        str | None,
-        Field(
-            description=(
-                "The exact title of the Confluence page. Use this with 'space_key' if 'page_id' is not known."
-            ),
-            default=None,
-        ),
-    ] = None,
-    space_key: Annotated[
-        str | None,
-        Field(
-            description=(
-                "The key of the Confluence space where the page resides (e.g., 'DEV', 'TEAM'). Required if using 'title'."
-            ),
-            default=None,
-        ),
-    ] = None,
-    include_metadata: Annotated[
-        bool,
-        Field(
-            description="Whether to include page metadata such as creation date, last update, version, and labels.",
-            default=True,
-        ),
-    ] = True,
-    convert_to_markdown: Annotated[
-        bool,
-        Field(
-            description=(
-                "Whether to convert page to markdown (true) or keep it in raw HTML format (false). "
-                "Raw HTML can reveal macros (like dates) not visible in markdown, but CAUTION: "
-                "using HTML significantly increases token usage in AI responses."
-            ),
-            default=True,
-        ),
-    ] = True,
-) -> str:
-    """Get content of a specific Confluence page by its ID, or by its title and space key.
-
-    Args:
-        ctx: The FastMCP context.
-        page_id: Confluence page ID. If provided, 'title' and 'space_key' are ignored.
-        title: The exact title of the page. Must be used with 'space_key'.
-        space_key: The key of the space. Must be used with 'title'.
-        include_metadata: Whether to include page metadata.
-        convert_to_markdown: Convert content to markdown (true) or keep raw HTML (false).
-
-    Returns:
-        JSON string representing the page content and/or metadata, or an error if not found or parameters are invalid.
-    """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-    page_object = None
-
-    if page_id:
-        if title or space_key:
-            logger.warning(
-                "page_id was provided; title and space_key parameters will be ignored."
-            )
-        try:
-            page_object = confluence_fetcher.get_page_content(
-                page_id, convert_to_markdown=convert_to_markdown
-            )
-        except Exception as e:
-            logger.error(f"Error fetching page by ID '{page_id}': {e}")
-            return json.dumps(
-                {"error": f"Failed to retrieve page by ID '{page_id}': {e}"},
-                indent=2,
-                ensure_ascii=False,
-            )
-    elif title and space_key:
-        page_object = confluence_fetcher.get_page_by_title(
-            space_key, title, convert_to_markdown=convert_to_markdown
-        )
-        if not page_object:
-            return json.dumps(
-                {
-                    "error": f"Page with title '{title}' not found in space '{space_key}'."
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-    else:
-        raise ValueError(
-            "Either 'page_id' OR both 'title' and 'space_key' must be provided."
+        results = confluence_fetcher.search(
+            cql=cql_query,
+            limit=limit,
+            spaces_filter=spaces_filter,
         )
 
-    if not page_object:
+        pages = []
+        for page in results:
+            pages.append({
+                "id": page.id,
+                "title": page.title,
+                "space_key": page.space.key if page.space else None,
+                "url": page.url,
+                "excerpt": page.content[:200] if page.content else None,
+            })
+
         return json.dumps(
-            {"error": "Page not found with the provided identifiers."},
+            {"success": True, "total": len(pages), "results": pages},
             indent=2,
             ensure_ascii=False,
         )
 
-    if include_metadata:
-        result = {"metadata": page_object.to_simplified_dict()}
-    else:
-        result = {"content": {"value": page_object.content}}
-
-    return json.dumps(result, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        return json.dumps(
+            {"error": f"Search failed: {str(e)}"},
+            indent=2,
+            ensure_ascii=False,
+        )
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
-async def get_page_children(
+async def get_spaces(
     ctx: Context,
-    parent_id: Annotated[
-        str,
-        Field(
-            description="The ID of the parent page whose children you want to retrieve"
-        ),
-    ],
-    expand: Annotated[
-        str,
-        Field(
-            description="Fields to expand in the response (e.g., 'version', 'body.storage')",
-            default="version",
-        ),
-    ] = "version",
     limit: Annotated[
         int,
-        Field(
-            description="Maximum number of child pages to return (1-50)",
-            default=25,
-            ge=1,
-            le=50,
-        ),
+        Field(description="Maximum number of spaces to return", ge=1, le=100, default=25),
     ] = 25,
-    include_content: Annotated[
-        bool,
-        Field(
-            description="Whether to include the page content in the response",
-            default=False,
-        ),
-    ] = False,
-    convert_to_markdown: Annotated[
-        bool,
-        Field(
-            description="Whether to convert page content to markdown (true) or keep it in raw HTML format (false). Only relevant if include_content is true.",
-            default=True,
-        ),
-    ] = True,
-    start: Annotated[
-        int,
-        Field(description="Starting index for pagination (0-based)", default=0, ge=0),
-    ] = 0,
 ) -> str:
-    """Get child pages of a specific Confluence page.
+    """List available Confluence spaces.
 
     Args:
         ctx: The FastMCP context.
-        parent_id: The ID of the parent page.
-        expand: Fields to expand.
-        limit: Maximum number of child pages.
-        include_content: Whether to include page content.
-        convert_to_markdown: Convert content to markdown if include_content is true.
-        start: Starting index for pagination.
+        limit: Maximum number of spaces to return.
 
     Returns:
-        JSON string representing a list of child page objects.
+        JSON string with list of spaces.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
-    if include_content and "body" not in expand:
-        expand = f"{expand},body.storage" if expand else "body.storage"
 
     try:
-        pages = confluence_fetcher.get_page_children(
-            page_id=parent_id,
-            start=start,
-            limit=limit,
-            expand=expand,
-            convert_to_markdown=convert_to_markdown,
-        )
-        child_pages = [page.to_simplified_dict() for page in pages]
-        result = {
-            "parent_id": parent_id,
-            "count": len(child_pages),
-            "limit_requested": limit,
-            "start_requested": start,
-            "results": child_pages,
-        }
-    except Exception as e:
-        logger.error(
-            f"Error getting/processing children for page ID {parent_id}: {e}",
-            exc_info=True,
-        )
-        result = {"error": f"Failed to get child pages: {e}"}
+        result = confluence_fetcher.get_spaces(start=0, limit=limit)
+        spaces = []
+        for space in result.get("results", []):
+            spaces.append({
+                "key": space.get("key"),
+                "name": space.get("name"),
+                "type": space.get("type"),
+            })
 
-    return json.dumps(result, indent=2, ensure_ascii=False)
+        return json.dumps(
+            {"success": True, "total": len(spaces), "spaces": spaces},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to get spaces: {e}")
+        return json.dumps(
+            {"error": f"Failed to get spaces: {str(e)}"},
+            indent=2,
+            ensure_ascii=False,
+        )
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
@@ -319,13 +853,7 @@ async def get_comments(
     ctx: Context,
     page_id: Annotated[
         str,
-        Field(
-            description=(
-                "Confluence page ID (numeric ID, can be parsed from URL, "
-                "e.g. from 'https://example.atlassian.net/wiki/spaces/TEAM/pages/123456789/Page+Title' "
-                "-> '123456789')"
-            )
-        ),
+        Field(description="Confluence page ID"),
     ],
 ) -> str:
     """Get comments for a specific Confluence page.
@@ -335,295 +863,35 @@ async def get_comments(
         page_id: Confluence page ID.
 
     Returns:
-        JSON string representing a list of comment objects.
-    """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-    comments = confluence_fetcher.get_page_comments(page_id)
-    formatted_comments = [comment.to_simplified_dict() for comment in comments]
-    return json.dumps(formatted_comments, indent=2, ensure_ascii=False)
-
-
-@confluence_mcp.tool(tags={"confluence", "read"})
-async def get_labels(
-    ctx: Context,
-    page_id: Annotated[
-        str,
-        Field(
-            description=(
-                "Confluence page ID (numeric ID, can be parsed from URL, "
-                "e.g. from 'https://example.atlassian.net/wiki/spaces/TEAM/pages/123456789/Page+Title' "
-                "-> '123456789')"
-            )
-        ),
-    ],
-) -> str:
-    """Get labels for a specific Confluence page.
-
-    Args:
-        ctx: The FastMCP context.
-        page_id: Confluence page ID.
-
-    Returns:
-        JSON string representing a list of label objects.
-    """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-    labels = confluence_fetcher.get_page_labels(page_id)
-    formatted_labels = [label.to_simplified_dict() for label in labels]
-    return json.dumps(formatted_labels, indent=2, ensure_ascii=False)
-
-
-@confluence_mcp.tool(tags={"confluence", "write"})
-@check_write_access
-async def add_label(
-    ctx: Context,
-    page_id: Annotated[str, Field(description="The ID of the page to update")],
-    name: Annotated[str, Field(description="The name of the label")],
-) -> str:
-    """Add label to an existing Confluence page.
-
-    Args:
-        ctx: The FastMCP context.
-        page_id: The ID of the page to update.
-        name: The name of the label.
-
-    Returns:
-        JSON string representing the updated list of label objects for the page.
-
-    Raises:
-        ValueError: If in read-only mode or Confluence client is unavailable.
-    """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-    labels = confluence_fetcher.add_page_label(page_id, name)
-    formatted_labels = [label.to_simplified_dict() for label in labels]
-    return json.dumps(formatted_labels, indent=2, ensure_ascii=False)
-
-
-@confluence_mcp.tool(tags={"confluence", "write"})
-@check_write_access
-async def create_page(
-    ctx: Context,
-    space_key: Annotated[
-        str,
-        Field(
-            description="The key of the space to create the page in (usually a short uppercase code like 'DEV', 'TEAM', or 'DOC')"
-        ),
-    ],
-    title: Annotated[str, Field(description="The title of the page")],
-    content: Annotated[
-        str,
-        Field(
-            description="The content of the page. Format depends on content_format parameter. Can be Markdown (default), wiki markup, or storage format"
-        ),
-    ],
-    parent_id: Annotated[
-        str | None,
-        Field(
-            description="(Optional) parent page ID. If provided, this page will be created as a child of the specified page",
-            default=None,
-        ),
-        BeforeValidator(lambda x: str(x) if x is not None else None),
-    ] = None,
-    content_format: Annotated[
-        str,
-        Field(
-            description="(Optional) The format of the content parameter. Options: 'markdown' (default), 'wiki', or 'storage'. Wiki format uses Confluence wiki markup syntax",
-            default="markdown",
-        ),
-    ] = "markdown",
-    enable_heading_anchors: Annotated[
-        bool,
-        Field(
-            description="(Optional) Whether to enable automatic heading anchor generation. Only applies when content_format is 'markdown'",
-            default=False,
-        ),
-    ] = False,
-) -> str:
-    """Create a new Confluence page.
-
-    Args:
-        ctx: The FastMCP context.
-        space_key: The key of the space.
-        title: The title of the page.
-        content: The content of the page (format depends on content_format).
-        parent_id: Optional parent page ID.
-        content_format: The format of the content ('markdown', 'wiki', or 'storage').
-        enable_heading_anchors: Whether to enable heading anchors (markdown only).
-
-    Returns:
-        JSON string representing the created page object.
-
-    Raises:
-        ValueError: If in read-only mode, Confluence client is unavailable, or invalid content_format.
+        JSON string with list of comments.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
-    # Validate content_format
-    if content_format not in ["markdown", "wiki", "storage"]:
-        raise ValueError(
-            f"Invalid content_format: {content_format}. Must be 'markdown', 'wiki', or 'storage'"
-        )
-
-    # Determine parameters based on content format
-    if content_format == "markdown":
-        is_markdown = True
-        content_representation = None  # Will be converted to storage
-    else:
-        is_markdown = False
-        content_representation = content_format  # Pass 'wiki' or 'storage' directly
-
-    page = confluence_fetcher.create_page(
-        space_key=space_key,
-        title=title,
-        body=content,
-        parent_id=parent_id,
-        is_markdown=is_markdown,
-        enable_heading_anchors=enable_heading_anchors
-        if content_format == "markdown"
-        else False,
-        content_representation=content_representation,
-    )
-    result = page.to_simplified_dict()
-    return json.dumps(
-        {"message": "Page created successfully", "page": result},
-        indent=2,
-        ensure_ascii=False,
-    )
-
-
-@confluence_mcp.tool(tags={"confluence", "write"})
-@check_write_access
-async def update_page(
-    ctx: Context,
-    page_id: Annotated[str, Field(description="The ID of the page to update")],
-    title: Annotated[str, Field(description="The new title of the page")],
-    content: Annotated[
-        str,
-        Field(
-            description="The new content of the page. Format depends on content_format parameter"
-        ),
-    ],
-    is_minor_edit: Annotated[
-        bool, Field(description="Whether this is a minor edit", default=False)
-    ] = False,
-    version_comment: Annotated[
-        str | None, Field(description="Optional comment for this version", default=None)
-    ] = None,
-    parent_id: Annotated[
-        str | None,
-        Field(description="Optional the new parent page ID", default=None),
-        BeforeValidator(lambda x: str(x) if x is not None else None),
-    ] = None,
-    content_format: Annotated[
-        str,
-        Field(
-            description="(Optional) The format of the content parameter. Options: 'markdown' (default), 'wiki', or 'storage'. Wiki format uses Confluence wiki markup syntax",
-            default="markdown",
-        ),
-    ] = "markdown",
-    enable_heading_anchors: Annotated[
-        bool,
-        Field(
-            description="(Optional) Whether to enable automatic heading anchor generation. Only applies when content_format is 'markdown'",
-            default=False,
-        ),
-    ] = False,
-) -> str:
-    """Update an existing Confluence page.
-
-    Args:
-        ctx: The FastMCP context.
-        page_id: The ID of the page to update.
-        title: The new title of the page.
-        content: The new content of the page (format depends on content_format).
-        is_minor_edit: Whether this is a minor edit.
-        version_comment: Optional comment for this version.
-        parent_id: Optional new parent page ID.
-        content_format: The format of the content ('markdown', 'wiki', or 'storage').
-        enable_heading_anchors: Whether to enable heading anchors (markdown only).
-
-    Returns:
-        JSON string representing the updated page object.
-
-    Raises:
-        ValueError: If Confluence client is not configured, available, or invalid content_format.
-    """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-
-    # Validate content_format
-    if content_format not in ["markdown", "wiki", "storage"]:
-        raise ValueError(
-            f"Invalid content_format: {content_format}. Must be 'markdown', 'wiki', or 'storage'"
-        )
-
-    # Determine parameters based on content format
-    if content_format == "markdown":
-        is_markdown = True
-        content_representation = None  # Will be converted to storage
-    else:
-        is_markdown = False
-        content_representation = content_format  # Pass 'wiki' or 'storage' directly
-
-    updated_page = confluence_fetcher.update_page(
-        page_id=page_id,
-        title=title,
-        body=content,
-        is_minor_edit=is_minor_edit,
-        version_comment=version_comment,
-        is_markdown=is_markdown,
-        parent_id=parent_id,
-        enable_heading_anchors=enable_heading_anchors
-        if content_format == "markdown"
-        else False,
-        content_representation=content_representation,
-    )
-    page_data = updated_page.to_simplified_dict()
-    return json.dumps(
-        {"message": "Page updated successfully", "page": page_data},
-        indent=2,
-        ensure_ascii=False,
-    )
-
-
-@confluence_mcp.tool(tags={"confluence", "write"})
-@check_write_access
-async def delete_page(
-    ctx: Context,
-    page_id: Annotated[str, Field(description="The ID of the page to delete")],
-) -> str:
-    """Delete an existing Confluence page.
-
-    Args:
-        ctx: The FastMCP context.
-        page_id: The ID of the page to delete.
-
-    Returns:
-        JSON string indicating success or failure.
-
-    Raises:
-        ValueError: If Confluence client is not configured or available.
-    """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
     try:
-        result = confluence_fetcher.delete_page(page_id=page_id)
-        if result:
-            response = {
-                "success": True,
-                "message": f"Page {page_id} deleted successfully",
-            }
-        else:
-            response = {
-                "success": False,
-                "message": f"Unable to delete page {page_id}. API request completed but deletion unsuccessful.",
-            }
-    except Exception as e:
-        logger.error(f"Error deleting Confluence page {page_id}: {str(e)}")
-        response = {
-            "success": False,
-            "message": f"Error deleting page {page_id}",
-            "error": str(e),
-        }
+        comments = confluence_fetcher.get_page_comments(page_id, return_markdown=True)
 
-    return json.dumps(response, indent=2, ensure_ascii=False)
+        comment_list = []
+        for comment in comments:
+            comment_list.append({
+                "id": comment.id,
+                "author": comment.author.display_name if comment.author else None,
+                "created": comment.created.isoformat() if comment.created else None,
+                "content": comment.body,
+            })
+
+        return json.dumps(
+            {"success": True, "page_id": page_id, "total": len(comment_list), "comments": comment_list},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to get comments for page {page_id}: {e}")
+        return json.dumps(
+            {"error": f"Failed to get comments: {str(e)}"},
+            indent=2,
+            ensure_ascii=False,
+        )
 
 
 @confluence_mcp.tool(tags={"confluence", "write"})
@@ -631,10 +899,12 @@ async def delete_page(
 async def add_comment(
     ctx: Context,
     page_id: Annotated[
-        str, Field(description="The ID of the page to add a comment to")
+        str,
+        Field(description="Confluence page ID"),
     ],
     content: Annotated[
-        str, Field(description="The comment content in Markdown format")
+        str,
+        Field(description="Comment content in Markdown format"),
     ],
 ) -> str:
     """Add a comment to a Confluence page.
@@ -645,35 +915,41 @@ async def add_comment(
         content: The comment content in Markdown format.
 
     Returns:
-        JSON string representing the created comment.
-
-    Raises:
-        ValueError: If in read-only mode or Confluence client is unavailable.
+        JSON string with the created comment.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
-    try:
-        comment = confluence_fetcher.add_comment(page_id=page_id, content=content)
-        if comment:
-            comment_data = comment.to_simplified_dict()
-            response = {
-                "success": True,
-                "message": "Comment added successfully",
-                "comment": comment_data,
-            }
-        else:
-            response = {
-                "success": False,
-                "message": f"Unable to add comment to page {page_id}. API request completed but comment creation unsuccessful.",
-            }
-    except Exception as e:
-        logger.error(f"Error adding comment to Confluence page {page_id}: {str(e)}")
-        response = {
-            "success": False,
-            "message": f"Error adding comment to page {page_id}",
-            "error": str(e),
-        }
 
-    return json.dumps(response, indent=2, ensure_ascii=False)
+    try:
+        comment = confluence_fetcher.add_comment(page_id, content)
+
+        if not comment:
+            return json.dumps(
+                {"error": "Failed to add comment"},
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        return json.dumps(
+            {
+                "success": True,
+                "comment": {
+                    "id": comment.id,
+                    "author": comment.author.display_name if comment.author else None,
+                    "created": comment.created.isoformat() if comment.created else None,
+                    "content": comment.body,
+                },
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to add comment to page {page_id}: {e}")
+        return json.dumps(
+            {"error": f"Failed to add comment: {str(e)}"},
+            indent=2,
+            ensure_ascii=False,
+        )
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
@@ -682,65 +958,260 @@ async def search_user(
     query: Annotated[
         str,
         Field(
-            description=(
-                "Search query - a CQL query string for user search. "
-                "Examples of CQL:\n"
-                "- Basic user lookup by full name: 'user.fullname ~ \"First Last\"'\n"
-                'Note: Special identifiers need proper quoting in CQL: personal space keys (e.g., "~username"), '
-                "reserved words, numeric IDs, and identifiers with special characters."
-            )
+            description="CQL query for user search. Example: 'user.fullname ~ \"John\"'"
         ),
     ],
     limit: Annotated[
         int,
-        Field(
-            description="Maximum number of results (1-50)",
-            default=10,
-            ge=1,
-            le=50,
-        ),
+        Field(description="Maximum number of results (1-50)", ge=1, le=50, default=10),
     ] = 10,
 ) -> str:
     """Search Confluence users using CQL.
 
     Args:
         ctx: The FastMCP context.
-        query: Search query - a CQL query string for user search.
+        query: CQL query string for user search.
         limit: Maximum number of results (1-50).
 
     Returns:
-        JSON string representing a list of simplified Confluence user search result objects.
+        JSON string with list of matching users.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
-    # If the query doesn't look like CQL, wrap it as a user fullname search
-    if query and not any(
-        x in query for x in ["=", "~", ">", "<", " AND ", " OR ", "user."]
-    ):
-        # Simple search term - search by fullname
-        query = f'user.fullname ~ "{query}"'
-        logger.info(f"Converting simple search term to user CQL: {query}")
-
     try:
-        user_results = confluence_fetcher.search_user(query, limit=limit)
-        search_results = [user.to_simplified_dict() for user in user_results]
-        return json.dumps(search_results, indent=2, ensure_ascii=False)
-    except MCPAtlassianAuthenticationError as e:
-        logger.error(f"Authentication error during user search: {e}", exc_info=False)
+        results = confluence_fetcher.search_user(cql=query, limit=limit)
+
+        users = []
+        for user in results:
+            users.append({
+                "account_id": user.account_id,
+                "display_name": user.display_name,
+                "email": user.email,
+            })
+
+        return json.dumps(
+            {"success": True, "total": len(users), "users": users},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        logger.error(f"User search failed: {e}")
+        return json.dumps(
+            {"error": f"User search failed: {str(e)}"},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+# =============================================================================
+# TOOLS - Attachments
+# =============================================================================
+
+
+@confluence_mcp.tool(tags={"confluence", "read"})
+async def download_attachments(
+    ctx: Context,
+    page_id: Annotated[
+        str,
+        Field(description="The ID of the page to download attachments from"),
+    ],
+) -> str:
+    """Download all attachments from a Confluence page to local storage.
+
+    Downloads all attachments (including inline images/screenshots) to an
+    'attachments' folder next to the page's HTML file.
+
+    The page must be synced locally first (use sync_space or read_page).
+
+    Attachments are referenced in Confluence HTML using these macros:
+    - Images: <ac:image><ri:attachment ri:filename="image.png"/></ac:image>
+    - Links: <ac:link><ri:attachment ri:filename="file.pdf"/></ac:link>
+
+    Args:
+        ctx: The FastMCP context.
+        page_id: The ID of the page to download attachments from.
+
+    Returns:
+        JSON string with list of downloaded files or error.
+    """
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # Find the page in local storage
+    page_info = get_page_info(page_id)
+
+    if not page_info:
         return json.dumps(
             {
-                "error": "Authentication failed. Please check your credentials.",
-                "details": str(e),
+                "error": f"Page '{page_id}' not found in local storage.",
+                "hint": "Use sync_space or read_page to sync the page first.",
             },
             indent=2,
             ensure_ascii=False,
         )
+
+    space_key = page_info["space_key"]
+    ancestors = page_info.get("ancestors", [])
+
+    try:
+        # Get attachments metadata from Confluence
+        attachments_response = confluence_fetcher.confluence.get_attachments_from_content(
+            page_id, start=0, limit=500
+        )
+        attachments = attachments_response.get("results", [])
+
+        if not attachments:
+            return json.dumps(
+                {
+                    "success": True,
+                    "page_id": page_id,
+                    "message": "No attachments found on this page.",
+                    "downloaded": [],
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        # Ensure attachments folder exists
+        attachments_folder = ensure_attachments_folder(space_key, ancestors, page_id)
+
+        # Use the built-in download method (handles authentication properly)
+        download_result = confluence_fetcher.confluence.download_attachments_from_page(
+            page_id, path=str(attachments_folder)
+        )
+
+        downloaded_count = download_result.get("attachments_downloaded", 0)
+
+        # Build list of downloaded files with metadata
+        downloaded = []
+        for attachment in attachments:
+            filename = attachment.get("title", "")
+            file_path = attachments_folder / filename
+            if file_path.exists():
+                downloaded.append({
+                    "filename": filename,
+                    "size": attachment.get("extensions", {}).get("fileSize"),
+                    "media_type": attachment.get("extensions", {}).get("mediaType"),
+                    "local_path": str(file_path.relative_to(Path.cwd())),
+                })
+
+        result = {
+            "success": True,
+            "page_id": page_id,
+            "attachments_folder": str(attachments_folder.relative_to(Path.cwd())),
+            "total_attachments": len(attachments),
+            "downloaded_count": downloaded_count,
+            "downloaded": downloaded,
+        }
+
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
     except Exception as e:
-        logger.error(f"Error searching users: {str(e)}")
+        logger.error(f"Failed to download attachments for page {page_id}: {e}")
+        return json.dumps(
+            {"error": f"Failed to download attachments: {str(e)}"},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+@confluence_mcp.tool(tags={"confluence", "write"})
+@check_write_access
+async def upload_attachment(
+    ctx: Context,
+    page_id: Annotated[
+        str,
+        Field(description="The ID of the page to upload the attachment to"),
+    ],
+    file_path: Annotated[
+        str,
+        Field(description="Absolute or relative path to the local file to upload"),
+    ],
+    comment: Annotated[
+        str | None,
+        Field(description="Optional comment for the attachment"),
+    ] = None,
+) -> str:
+    """Upload a file as an attachment to a Confluence page.
+
+    After uploading, the attachment is available but NOT displayed inline.
+    To display the attachment inline on the page, follow these steps:
+
+    1. Upload the file using this tool
+    2. Edit the local HTML file to add the appropriate macro:
+       - For images: <ac:image><ri:attachment ri:filename="image.png"/></ac:image>
+       - For file links: <ac:link><ri:attachment ri:filename="file.pdf"/></ac:link>
+    3. Push the changes using push_page_update
+
+    Example image with alignment:
+    <ac:image ac:align="center" ac:layout="center">
+      <ri:attachment ri:filename="screenshot.png"/>
+    </ac:image>
+
+    Args:
+        ctx: The FastMCP context.
+        page_id: The ID of the page to upload the attachment to.
+        file_path: Path to the local file to upload.
+        comment: Optional comment for the attachment.
+
+    Returns:
+        JSON string with upload result or error.
+    """
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # Resolve the file path
+    local_file = Path(file_path)
+    if not local_file.is_absolute():
+        local_file = Path.cwd() / file_path
+
+    if not local_file.exists():
+        return json.dumps(
+            {"error": f"File not found: {file_path}"},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    if not local_file.is_file():
+        return json.dumps(
+            {"error": f"Path is not a file: {file_path}"},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    try:
+        # Upload the attachment
+        result = confluence_fetcher.confluence.attach_file(
+            filename=str(local_file),
+            page_id=page_id,
+            comment=comment,
+        )
+
+        if not result:
+            return json.dumps(
+                {"error": "Upload failed - no response from server"},
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        # Extract attachment info from result
+        attachment_info = result.get("results", [result])[0] if isinstance(result, dict) else result
+
         return json.dumps(
             {
-                "error": f"An unexpected error occurred while searching for users: {str(e)}"
+                "success": True,
+                "page_id": page_id,
+                "filename": local_file.name,
+                "attachment_id": attachment_info.get("id") if isinstance(attachment_info, dict) else None,
+                "message": f"Successfully uploaded {local_file.name}",
             },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to upload attachment to page {page_id}: {e}")
+        return json.dumps(
+            {"error": f"Failed to upload attachment: {str(e)}"},
             indent=2,
             ensure_ascii=False,
         )

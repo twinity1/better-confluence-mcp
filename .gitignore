@@ -75,3 +75,6 @@ playground/
 
 # Claude
 .claude/
+
+# Local Confluence cache
+.better-confluence-mcp/

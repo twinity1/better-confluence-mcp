@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 from mcp_atlassian.preprocessing.confluence import ConfluencePreprocessor
-from mcp_atlassian.preprocessing.jira import JiraPreprocessor
 
 
 class MockConfluenceClient:
@@ -34,328 +33,12 @@ class MockConfluenceClient:
 
 
 @pytest.fixture
-def jira_preprocessor():
-    """Create a JiraPreprocessor instance."""
-    return JiraPreprocessor(base_url="https://example.atlassian.net")
-
-
-@pytest.fixture
 def confluence_preprocessor():
     """Create a ConfluencePreprocessor instance with mock client."""
     return ConfluencePreprocessor(
         base_url="https://example.atlassian.net",
         confluence_client=MockConfluenceClient(),
     )
-
-
-@pytest.mark.integration
-class TestJiraContentProcessing:
-    """Integration tests for Jira content processing."""
-
-    def test_jira_markdown_roundtrip_simple(self, jira_preprocessor):
-        """Test simple Jira markup to Markdown and back."""
-        jira_markup = """h1. Main Title
-
-This is *bold* and _italic_ text.
-
-* List item 1
-* List item 2
-# Numbered item 1
-# Numbered item 2"""
-
-        # Convert to Markdown
-        markdown = jira_preprocessor.jira_to_markdown(jira_markup)
-
-        # Convert back to Jira
-        jira_result = jira_preprocessor.markdown_to_jira(markdown)
-
-        # Verify key elements are preserved
-        assert "h1. Main Title" in jira_result
-        assert "*bold*" in jira_result
-        assert "_italic_" in jira_result
-        assert "* List item 1" in jira_result
-        # Numbered lists in Jira are converted to "1." format in markdown
-        assert "1. Numbered item 1" in jira_result or "# Numbered item 1" in jira_result
-
-    def test_jira_markdown_roundtrip_complex(self, jira_preprocessor):
-        """Test complex Jira markup with code blocks, tables, and formatting."""
-        jira_markup = """h1. Project Documentation
-
-h2. Overview
-This project uses *advanced* features with _emphasis_ and {{inline code}}.
-
-h3. Code Example
-{code:python}
-def process_data(items):
-    '''Process a list of items.'''
-    for item in items:
-        print(f"Processing {item}")
-    return len(items)
-{code}
-
-h3. Table Example
-||Header 1||Header 2||Header 3||
-|Cell 1|Cell 2|Cell 3|
-|Cell 4|Cell 5|Cell 6|
-
-h3. Features
-* Feature with *bold* text
-** Nested feature with _italic_
-*** Deep nested item
-# First step
-## Sub-step A
-## Sub-step B
-
-bq. This is a block quote with *formatting*
-
-h3. Links and Images
-[Jira Documentation|https://docs.atlassian.com/jira]
-!image.png|alt=Screenshot!
-
-h3. Special Formatting
-+inserted text+
--deleted text-
-^superscript^
-~subscript~
-??citation??
-
-{noformat}
-Raw text that should not be formatted
-    with preserved    spacing
-{noformat}
-
-{quote}
-This is a quoted section
-with multiple lines
-{quote}
-
-{color:red}Red text{color}
-{color:#0000FF}Blue text{color}"""
-
-        # Convert to Markdown
-        markdown = jira_preprocessor.jira_to_markdown(jira_markup)
-
-        # Convert back to Jira
-        jira_result = jira_preprocessor.markdown_to_jira(markdown)
-
-        # Verify structure is preserved
-        assert "h1. Project Documentation" in jira_result
-        assert "h2. Overview" in jira_result
-        assert "h3. Code Example" in jira_result
-
-        # Verify code block
-        assert "{code:python}" in jira_result
-        assert "def process_data(items):" in jira_result
-        assert "{code}" in jira_result
-
-        # Verify table structure
-        assert "||Header 1||Header 2||Header 3||" in jira_result
-        assert "|Cell 1|Cell 2|Cell 3|" in jira_result
-
-        # Verify lists (may be converted differently)
-        assert "Feature with" in jira_result and "bold" in jira_result
-        assert "First step" in jira_result
-
-        # Verify special formatting
-        assert "+inserted text+" in jira_result
-        assert "-deleted text-" in jira_result
-        assert "^superscript^" in jira_result
-        assert "~subscript~" in jira_result
-        assert "??citation??" in jira_result
-
-        # Verify links
-        assert "Jira Documentation" in jira_result
-        assert "https://docs.atlassian.com/jira" in jira_result
-
-        # Verify color formatting
-        assert "Red text" in jira_result
-        assert "Blue text" in jira_result
-
-    def test_jira_user_mentions_processing(self, jira_preprocessor):
-        """Test processing of Jira user mentions."""
-        content = """h1. Team Update
-
-[~accountid:12345] completed the task.
-[~accountid:67890] is reviewing the changes.
-
-See [PROJ-123|https://example.atlassian.net/browse/PROJ-123|smart-link] for details."""
-
-        cleaned = jira_preprocessor.clean_jira_text(content)
-
-        # User mentions should be processed
-        assert "User:12345" in cleaned
-        assert "User:67890" in cleaned
-
-        # Smart link should be converted
-        assert "[PROJ-123](https://example.atlassian.net/browse/PROJ-123)" in cleaned
-
-    def test_jira_html_content_processing(self, jira_preprocessor):
-        """Test processing of HTML content in Jira."""
-        html_content = """<p>This is a <strong>test</strong> with <em>HTML</em> content.</p>
-<ul>
-<li>Item 1</li>
-<li>Item 2 with <code>inline code</code></li>
-</ul>
-<blockquote>
-<p>A quote with <strong>formatting</strong></p>
-</blockquote>
-<pre><code class="language-python">def hello():
-    print("Hello, World!")
-</code></pre>"""
-
-        cleaned = jira_preprocessor.clean_jira_text(html_content)
-
-        # Verify HTML is converted to Markdown
-        assert "**test**" in cleaned
-        assert "*HTML*" in cleaned
-        assert "`inline code`" in cleaned
-        assert "def hello():" in cleaned
-
-    def test_jira_nested_lists_preservation(self, jira_preprocessor):
-        """Test preservation of nested list structures."""
-        jira_markup = """* Level 1 item
-** Level 2 item
-*** Level 3 item
-**** Level 4 item
-** Another Level 2
-* Back to Level 1
-
-# Numbered Level 1
-## Numbered Level 2
-### Numbered Level 3
-## Another Numbered Level 2
-# Back to Numbered Level 1"""
-
-        markdown = jira_preprocessor.jira_to_markdown(jira_markup)
-        jira_result = jira_preprocessor.markdown_to_jira(markdown)
-
-        # Verify nested structure is preserved (checking for presence of items)
-        assert "Level 1 item" in jira_result
-        assert "Level 2 item" in jira_result
-        assert "Level 3 item" in jira_result
-        assert "Level 4 item" in jira_result
-
-        assert "Numbered Level 1" in jira_result
-        assert "Numbered Level 2" in jira_result
-        assert "Numbered Level 3" in jira_result
-
-    def test_jira_special_characters_preservation(self, jira_preprocessor):
-        """Test preservation of special characters and Unicode."""
-        jira_markup = """h1. Special Characters Test
-
-Unicode: α β γ δ ε ζ η θ
-Emojis: 🚀 💻 ✅ ❌ 📝
-Symbols: © ® ™ € £ ¥ § ¶
-
-Special chars in code:
-{code}
-if (x > 0 && y < 10) {
-    return x & y | z ^ w;
-}
-{code}
-
-Math: x² + y² = z²
-Quotes: "curly quotes" and 'single quotes'
-Dashes: em—dash and en–dash"""
-
-        markdown = jira_preprocessor.jira_to_markdown(jira_markup)
-        jira_result = jira_preprocessor.markdown_to_jira(markdown)
-
-        # Verify Unicode preservation
-        assert "α β γ δ ε ζ η θ" in jira_result
-        assert "🚀 💻 ✅ ❌ 📝" in jira_result
-        assert "© ® ™ € £ ¥ § ¶" in jira_result
-
-        # Verify special characters in code
-        assert "x > 0 && y < 10" in jira_result
-        assert "x & y | z ^ w" in jira_result
-
-        # Verify other special characters
-        assert "x² + y² = z²" in jira_result
-        assert '"curly quotes"' in jira_result
-        assert "em—dash" in jira_result
-        assert "en–dash" in jira_result
-
-    def test_jira_large_content_performance(self, jira_preprocessor):
-        """Test performance with large content (>1MB)."""
-        # Generate large content
-        large_content_parts = []
-
-        # Add many sections (increase to 200 for larger content)
-        for i in range(200):
-            section = f"""h2. Section {i}
-
-This is paragraph {i} with *bold* and _italic_ text.
-
-* List item {i}.1
-* List item {i}.2
-* List item {i}.3
-
-{{code:python}}
-def function_{i}():
-    # Function {i} implementation
-    data = [{{"id": j, "value": j * {i}}} for j in range(100)]
-    return sum(item["value"] for item in data)
-{{code}}
-
-||Header A||Header B||Header C||
-|Row {i} Cell 1|Row {i} Cell 2|Row {i} Cell 3|
-
-"""
-            large_content_parts.append(section)
-
-        large_content = "\n".join(large_content_parts)
-        content_size = len(large_content.encode("utf-8"))
-
-        # Ensure content is reasonably large (adjust threshold for test)
-        assert content_size > 50000  # 50KB is enough for performance testing
-
-        # Test conversion performance
-        start_time = time.time()
-        markdown = jira_preprocessor.jira_to_markdown(large_content)
-        markdown_time = time.time() - start_time
-
-        start_time = time.time()
-        jira_result = jira_preprocessor.markdown_to_jira(markdown)
-        jira_time = time.time() - start_time
-
-        # Performance assertions (should complete in reasonable time)
-        assert markdown_time < 10.0  # Should complete within 10 seconds
-        assert jira_time < 10.0
-
-        # Verify content integrity
-        assert "Section 0" in jira_result
-        assert "Section 199" in jira_result
-        assert (
-            "function" in jira_result
-        )  # Function names might have escaped underscores
-
-    def test_jira_edge_cases(self, jira_preprocessor):
-        """Test edge cases in Jira content processing."""
-        # Empty content
-        assert jira_preprocessor.jira_to_markdown("") == ""
-        assert jira_preprocessor.markdown_to_jira("") == ""
-        assert jira_preprocessor.clean_jira_text("") == ""
-        assert jira_preprocessor.clean_jira_text(None) == ""
-
-        # Malformed markup
-        malformed = "*unclosed bold _mixed italic*"
-        result = jira_preprocessor.jira_to_markdown(malformed)
-        assert "**unclosed bold" in result
-
-        # Very long lines
-        long_line = "x" * 10000
-        result = jira_preprocessor.jira_to_markdown(long_line)
-        assert len(result) >= 10000
-
-        # Nested code blocks (should not process inner content)
-        nested = """{code}
-{code}
-inner code
-{code}
-{code}"""
-        result = jira_preprocessor.jira_to_markdown(nested)
-        assert "inner code" in result
 
 
 @pytest.mark.integration
@@ -760,58 +443,11 @@ def function_{i}():
 
 
 @pytest.mark.integration
-class TestContentProcessingInteroperability:
-    """Test interoperability between Jira and Confluence content processing."""
+class TestContentProcessingUnicode:
+    """Test Unicode handling in content processing."""
 
-    def test_cross_platform_content_sharing(
-        self, jira_preprocessor, confluence_preprocessor
-    ):
-        """Test content that might be shared between Jira and Confluence."""
-        shared_markdown = """# Shared Documentation
-
-## Overview
-This content might be used in both Jira and Confluence.
-
-### Key Features
-- **Feature 1**: Description with *emphasis*
-- **Feature 2**: Contains `code examples`
-
-### Code Sample
-```python
-def shared_function():
-    return "Works in both platforms"
-```
-
-### Links
-[Project Documentation](https://example.com/docs)
-[PROJ-123](https://example.atlassian.net/browse/PROJ-123)
-
-### Table
-| Platform | Support |
-|----------|---------|
-| Jira     | ✅      |
-| Confluence | ✅    |"""
-
-        # Convert to Jira format
-        jira_markup = jira_preprocessor.markdown_to_jira(shared_markdown)
-
-        # Convert to Confluence format
-        confluence_storage = confluence_preprocessor.markdown_to_confluence_storage(
-            shared_markdown
-        )
-
-        # Verify both conversions preserve key content
-        assert "Shared Documentation" in jira_markup
-        assert "Shared Documentation" in confluence_storage
-
-        assert "Feature 1" in jira_markup
-        assert "Feature 1" in confluence_storage
-
-        assert "shared_function" in jira_markup
-        assert "shared_function" in confluence_storage
-
-    def test_unicode_consistency(self, jira_preprocessor, confluence_preprocessor):
-        """Test Unicode handling consistency across processors."""
+    def test_unicode_consistency(self, confluence_preprocessor):
+        """Test Unicode handling consistency in Confluence processing."""
         unicode_content = """Unicode Test 🌍
 
 Symbols: ™ © ® € £ ¥
@@ -821,34 +457,23 @@ Arrows: → ← ↑ ↓ ↔ ⇒ ⇐ ⇔
 Box Drawing: ┌─┬─┐ │ ├─┼─┤ └─┴─┘
 Emojis: 😀 😎 🚀 💻 ✅ ❌ ⚡ 🔥"""
 
-        # Process through Jira
-        jira_result = jira_preprocessor.clean_jira_text(unicode_content)
-
         # Process through Confluence
         processed_html, confluence_result = (
             confluence_preprocessor.process_html_content(f"<p>{unicode_content}</p>")
         )
 
-        # Verify Unicode is preserved in both
+        # Verify Unicode is preserved
         for char in ["🌍", "™", "∑", "Α", "→", "┌", "😀", "🚀"]:
-            assert char in jira_result
             assert char in confluence_result
 
-    def test_error_recovery(self, jira_preprocessor, confluence_preprocessor):
+    def test_error_recovery(self, confluence_preprocessor):
         """Test error recovery in content processing."""
-        # Test with None input
-        assert jira_preprocessor.clean_jira_text(None) == ""
-
         # Test with invalid input types (should raise exceptions)
         with pytest.raises(Exception):
             confluence_preprocessor.process_html_content(None)
 
         # Test with extremely malformed content
         malformed_content = "<<<>>>&&&'''\"\"\"{{{{}}}}[[[[]]]]"
-
-        # Jira should handle this
-        jira_result = jira_preprocessor.clean_jira_text(malformed_content)
-        assert len(jira_result) > 0
 
         # Confluence should handle this
         processed_html, confluence_result = (

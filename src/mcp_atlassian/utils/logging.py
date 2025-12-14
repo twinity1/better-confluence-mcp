@@ -38,7 +38,7 @@ def setup_logging(
     root_logger.addHandler(handler)
 
     # Configure specific loggers
-    loggers = ["mcp-atlassian", "mcp.server", "mcp.server.lowlevel.server", "mcp-jira"]
+    loggers = ["mcp-atlassian", "mcp.server", "mcp.server.lowlevel.server"]
 
     for logger_name in loggers:
         logger = logging.getLogger(logger_name)
@@ -109,7 +109,7 @@ def log_config_param(
 
     Args:
         logger: The logger to use
-        service: The service name (Jira or Confluence)
+        service: The service name (e.g., Confluence)
         param: The parameter name
         value: The parameter value
         sensitive: Whether the value should be masked

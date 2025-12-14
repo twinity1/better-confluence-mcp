@@ -3,41 +3,6 @@
 from typing import Any
 
 
-class JiraIssueFactory:
-    """Factory for creating Jira issue test data."""
-
-    @staticmethod
-    def create(key: str = "TEST-123", **overrides) -> dict[str, Any]:
-        """Create a Jira issue with default values."""
-        defaults = {
-            "id": "12345",
-            "key": key,
-            "self": f"https://test.atlassian.net/rest/api/3/issue/{key}",
-            "fields": {
-                "summary": "Test Issue Summary",
-                "description": "Test issue description",
-                "status": {"name": "Open", "id": "1", "statusCategory": {"key": "new"}},
-                "issuetype": {"name": "Task", "id": "10001"},
-                "priority": {"name": "Medium", "id": "3"},
-                "assignee": {
-                    "displayName": "Test User",
-                    "emailAddress": "test@example.com",
-                },
-                "created": "2023-01-01T12:00:00.000+0000",
-                "updated": "2023-01-01T12:00:00.000+0000",
-            },
-        }
-        return deep_merge(defaults, overrides)
-
-    @staticmethod
-    def create_minimal(key: str = "TEST-123") -> dict[str, Any]:
-        """Create minimal Jira issue for basic tests."""
-        return {
-            "key": key,
-            "fields": {"summary": "Test Issue", "status": {"name": "Open"}},
-        }
-
-
 class ConfluencePageFactory:
     """Factory for creating Confluence page test data."""
 
@@ -64,20 +29,6 @@ class ConfluencePageFactory:
 
 class AuthConfigFactory:
     """Factory for authentication configuration objects."""
-
-    @staticmethod
-    def create_oauth_config(**overrides) -> dict[str, str]:
-        """Create OAuth configuration."""
-        defaults = {
-            "client_id": "test-client-id",
-            "client_secret": "test-client-secret",
-            "redirect_uri": "http://localhost:8080/callback",
-            "scope": "read:jira-work write:jira-work",
-            "cloud_id": "test-cloud-id",
-            "access_token": "test-access-token",
-            "refresh_token": "test-refresh-token",
-        }
-        return {**defaults, **overrides}
 
     @staticmethod
     def create_basic_auth_config(**overrides) -> dict[str, str]:

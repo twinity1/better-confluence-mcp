@@ -1,11 +1,11 @@
-"""Reusable mock utilities and fixtures for MCP Atlassian tests."""
+"""Reusable mock utilities and fixtures for Better Confluence MCP tests."""
 
 import os
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from .factories import AuthConfigFactory, ConfluencePageFactory, JiraIssueFactory
+from .factories import AuthConfigFactory, ConfluencePageFactory
 
 
 class MockEnvironment:
@@ -13,29 +13,11 @@ class MockEnvironment:
 
     @staticmethod
     @contextmanager
-    def oauth_env():
-        """Context manager for OAuth environment variables."""
-        oauth_vars = AuthConfigFactory.create_oauth_config()
-        env_vars = {
-            "ATLASSIAN_OAUTH_CLIENT_ID": oauth_vars["client_id"],
-            "ATLASSIAN_OAUTH_CLIENT_SECRET": oauth_vars["client_secret"],
-            "ATLASSIAN_OAUTH_REDIRECT_URI": oauth_vars["redirect_uri"],
-            "ATLASSIAN_OAUTH_SCOPE": oauth_vars["scope"],
-            "ATLASSIAN_OAUTH_CLOUD_ID": oauth_vars["cloud_id"],
-        }
-        with patch.dict(os.environ, env_vars, clear=False):
-            yield env_vars
-
-    @staticmethod
-    @contextmanager
     def basic_auth_env():
         """Context manager for basic auth environment variables."""
         auth_config = AuthConfigFactory.create_basic_auth_config()
         env_vars = {
-            "JIRA_URL": auth_config["url"],
-            "JIRA_USERNAME": auth_config["username"],
-            "JIRA_API_TOKEN": auth_config["api_token"],
-            "CONFLUENCE_URL": f"{auth_config['url']}/wiki",
+            "CONFLUENCE_URL": auth_config["url"],
             "CONFLUENCE_USERNAME": auth_config["username"],
             "CONFLUENCE_API_TOKEN": auth_config["api_token"],
         }
@@ -47,18 +29,10 @@ class MockEnvironment:
     def clean_env():
         """Context manager with no authentication environment variables."""
         auth_vars = [
-            "JIRA_URL",
-            "JIRA_USERNAME",
-            "JIRA_API_TOKEN",
             "CONFLUENCE_URL",
             "CONFLUENCE_USERNAME",
             "CONFLUENCE_API_TOKEN",
-            "ATLASSIAN_OAUTH_CLIENT_ID",
-            "ATLASSIAN_OAUTH_CLIENT_SECRET",
-            "ATLASSIAN_OAUTH_REDIRECT_URI",
-            "ATLASSIAN_OAUTH_SCOPE",
-            "ATLASSIAN_OAUTH_CLOUD_ID",
-            "ATLASSIAN_OAUTH_ENABLE",
+            "CONFLUENCE_PERSONAL_TOKEN",
         ]
 
         # Remove auth vars from environment
@@ -70,36 +44,6 @@ class MockEnvironment:
 
 class MockAtlassianClient:
     """Factory for creating mock Atlassian clients."""
-
-    @staticmethod
-    def create_jira_client(**response_overrides):
-        """Create a mock Jira client with common responses."""
-        client = MagicMock()
-
-        # Default responses
-        default_responses = {
-            "issue": JiraIssueFactory.create(),
-            "search_issues": {
-                "issues": [
-                    JiraIssueFactory.create("TEST-1"),
-                    JiraIssueFactory.create("TEST-2"),
-                ],
-                "total": 2,
-            },
-            "projects": [{"key": "TEST", "name": "Test Project"}],
-            "fields": [{"id": "summary", "name": "Summary"}],
-        }
-
-        # Merge with overrides
-        responses = {**default_responses, **response_overrides}
-
-        # Set up mock methods
-        client.issue.return_value = responses["issue"]
-        client.search_issues.return_value = responses["search_issues"]
-        client.projects.return_value = responses["projects"]
-        client.fields.return_value = responses["fields"]
-
-        return client
 
     @staticmethod
     def create_confluence_client(**response_overrides):
@@ -129,31 +73,6 @@ class MockAtlassianClient:
         client.get_all_spaces.return_value = responses["get_all_spaces"]
 
         return client
-
-
-class MockOAuthServer:
-    """Utility for mocking OAuth server interactions."""
-
-    @staticmethod
-    @contextmanager
-    def mock_oauth_flow():
-        """Context manager for mocking complete OAuth flow."""
-        with (
-            patch("http.server.HTTPServer") as mock_server,
-            patch("webbrowser.open") as mock_browser,
-            patch("secrets.token_urlsafe") as mock_token,
-        ):
-            # Configure mocks
-            mock_token.return_value = "test-state-token"
-            mock_server_instance = MagicMock()
-            mock_server.return_value = mock_server_instance
-
-            yield {
-                "server": mock_server,
-                "server_instance": mock_server_instance,
-                "browser": mock_browser,
-                "token": mock_token,
-            }
 
 
 class MockFastMCP:

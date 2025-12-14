@@ -1,6 +1,6 @@
-# MCP Atlassian Test Fixtures Documentation
+# MCP Confluence Test Fixtures Documentation
 
-This document describes the enhanced test fixture system implemented for the MCP Atlassian project.
+This document describes the enhanced test fixture system implemented for the Better Confluence MCP project.
 
 ## Overview
 
@@ -18,7 +18,6 @@ The test fixture system has been significantly improved to provide:
 tests/
 ├── conftest.py                 # Root fixtures with session-scoped data
 ├── unit/
-│   ├── jira/conftest.py       # Jira-specific fixtures
 │   ├── confluence/conftest.py # Confluence-specific fixtures
 │   └── models/conftest.py     # Model testing fixtures
 ├── utils/                     # Test utilities framework
@@ -27,7 +26,6 @@ tests/
 │   ├── base.py               # Base test classes
 │   └── assertions.py         # Custom assertions
 └── fixtures/                  # Legacy mock data
-    ├── jira_mocks.py         # Static Jira mock data
     └── confluence_mocks.py   # Static Confluence mock data
 ```
 
@@ -39,35 +37,32 @@ These fixtures are computed once per test session to improve performance:
 
 - `session_auth_configs`: Authentication configuration templates
 - `session_mock_data`: Mock data templates for API responses
-- `session_jira_field_definitions`: Jira field definitions
-- `session_jira_projects`: Jira project data
 - `session_confluence_spaces`: Confluence space definitions
 
 ```python
 # Example usage
-def test_with_session_data(session_jira_field_definitions):
-    # Uses cached field definitions, computed once per session
-    assert len(session_jira_field_definitions) > 0
+def test_with_session_data(session_mock_data):
+    # Uses cached data, computed once per session
+    assert session_mock_data["confluence_page"] is not None
 ```
 
 ### 2. Factory-Based Fixtures
 
 These fixtures return factory functions for creating customizable test data:
 
-- `make_jira_issue`: Create Jira issues with custom properties
 - `make_confluence_page`: Create Confluence pages with custom properties
 - `make_auth_config`: Create authentication configurations
 - `make_api_error`: Create API error responses
 
 ```python
 # Example usage
-def test_custom_issue(make_jira_issue):
-    issue = make_jira_issue(
-        key="CUSTOM-123",
-        fields={"priority": {"name": "High"}}
+def test_custom_page(make_confluence_page):
+    page = make_confluence_page(
+        title="Custom Page",
+        space={"key": "CUSTOM"}
     )
-    assert issue["key"] == "CUSTOM-123"
-    assert issue["fields"]["priority"]["name"] == "High"
+    assert page["title"] == "Custom Page"
+    assert page["space"]["key"] == "CUSTOM"
 ```
 
 ### 3. Environment Management
@@ -75,16 +70,15 @@ def test_custom_issue(make_jira_issue):
 Enhanced environment fixtures for testing different authentication scenarios:
 
 - `clean_environment`: No authentication variables
-- `oauth_environment`: OAuth setup
 - `basic_auth_environment`: Basic auth setup
 - `parametrized_auth_env`: Parameterized auth testing
 
 ```python
 # Example usage
 @pytest.mark.parametrize("parametrized_auth_env",
-                       ["oauth", "basic_auth"], indirect=True)
+                       ["basic_auth"], indirect=True)
 def test_auth_scenarios(parametrized_auth_env):
-    # Test runs once for OAuth and once for basic auth
+    # Test runs with basic auth environment
     pass
 ```
 
@@ -92,17 +86,13 @@ def test_auth_scenarios(parametrized_auth_env):
 
 Improved mock clients with better integration:
 
-- `mock_jira_client`: Pre-configured mock Jira client
 - `mock_confluence_client`: Pre-configured mock Confluence client
-- `enhanced_mock_jira_client`: Factory-integrated Jira client
 - `enhanced_mock_confluence_client`: Factory-integrated Confluence client
 
 ### 5. Specialized Data Fixtures
 
 Domain-specific fixtures for complex testing scenarios:
 
-- `make_jira_issue_with_worklog`: Issues with worklog data
-- `make_jira_search_results`: JQL search results
 - `make_confluence_page_with_content`: Pages with rich content
 - `make_confluence_search_results`: CQL search results
 
@@ -113,13 +103,11 @@ Domain-specific fixtures for complex testing scenarios:
 Use the enhanced factory-based fixtures:
 
 ```python
-def test_new_functionality(make_jira_issue, make_confluence_page):
+def test_new_functionality(make_confluence_page):
     # Create custom test data
-    issue = make_jira_issue(key="NEW-123")
     page = make_confluence_page(title="New Test Page")
 
     # Test your functionality
-    assert issue["key"] == "NEW-123"
     assert page["title"] == "New Test Page"
 ```
 
@@ -128,9 +116,8 @@ def test_new_functionality(make_jira_issue, make_confluence_page):
 Existing tests continue to work without changes due to backward compatibility:
 
 ```python
-def test_existing_functionality(jira_issue_data, confluence_page_data):
+def test_existing_functionality(confluence_page_data):
     # These fixtures still work as before
-    assert jira_issue_data["key"] == "TEST-123"
     assert confluence_page_data["title"] == "Test Page"
 ```
 
@@ -139,9 +126,8 @@ def test_existing_functionality(jira_issue_data, confluence_page_data):
 Use large dataset fixtures for performance tests:
 
 ```python
-def test_performance(large_jira_dataset, large_confluence_dataset):
-    # 100 issues and pages for performance testing
-    assert len(large_jira_dataset) == 100
+def test_performance(large_confluence_dataset):
+    # 100 pages for performance testing
     assert len(large_confluence_dataset) == 100
 ```
 
@@ -159,14 +145,14 @@ Take advantage of session-scoped fixtures for data that doesn't change:
 
 ```python
 # Good: Uses session-scoped data
-def test_field_parsing(session_jira_field_definitions):
-    parser = FieldParser(session_jira_field_definitions)
+def test_space_parsing(session_confluence_spaces):
+    parser = SpaceParser(session_confluence_spaces)
     assert parser.is_valid()
 
 # Avoid: Creates new data every time
-def test_field_parsing():
-    fields = create_field_definitions()  # Expensive operation
-    parser = FieldParser(fields)
+def test_space_parsing():
+    spaces = create_space_definitions()  # Expensive operation
+    parser = SpaceParser(spaces)
     assert parser.is_valid()
 ```
 
@@ -176,13 +162,13 @@ Use factories to create exactly the data you need:
 
 ```python
 # Good: Creates minimal required data
-def test_issue_key_validation(make_jira_issue):
-    issue = make_jira_issue(key="VALID-123")
-    assert validate_key(issue["key"])
+def test_page_id_validation(make_confluence_page):
+    page = make_confluence_page(page_id="123456")
+    assert validate_id(page["id"])
 
 # Avoid: Uses complex data when simple would do
-def test_issue_key_validation(complete_jira_issue_data):
-    assert validate_key(complete_jira_issue_data["key"])
+def test_page_id_validation(complete_confluence_page_data):
+    assert validate_id(complete_confluence_page_data["id"])
 ```
 
 ### 4. Environment Testing
@@ -191,12 +177,12 @@ Use parametrized fixtures for testing multiple scenarios:
 
 ```python
 @pytest.mark.parametrize("parametrized_auth_env",
-                       ["oauth", "basic_auth", "clean"], indirect=True)
+                       ["basic_auth", "clean"], indirect=True)
 def test_auth_detection(parametrized_auth_env):
     # Test with different auth environments
     detector = AuthDetector()
     auth_type = detector.detect_auth_type()
-    assert auth_type in ["oauth", "basic", None]
+    assert auth_type in ["basic", None]
 ```
 
 ## Backward Compatibility
@@ -221,34 +207,26 @@ The enhanced fixture system provides significant performance improvements:
 ### Basic Usage
 
 ```python
-def test_jira_issue_creation(make_jira_issue):
-    # Create a custom issue
-    issue = make_jira_issue(
-        key="TEST-456",
-        fields={"summary": "Custom test issue"}
+def test_confluence_page_creation(make_confluence_page):
+    # Create a custom page
+    page = make_confluence_page(
+        page_id="123456",
+        title="Custom test page"
     )
 
-    # Test the issue
-    model = JiraIssue.from_dict(issue)
-    assert model.key == "TEST-456"
-    assert model.summary == "Custom test issue"
+    # Test the page
+    model = ConfluencePage.from_dict(page)
+    assert model.id == "123456"
+    assert model.title == "Custom test page"
 ```
 
 ### Advanced Usage
 
 ```python
 def test_complex_workflow(
-    make_jira_issue_with_worklog,
     make_confluence_page_with_content,
-    oauth_environment
+    basic_auth_environment
 ):
-    # Create issue with worklog
-    issue = make_jira_issue_with_worklog(
-        key="WORKFLOW-123",
-        worklog_hours=8,
-        worklog_comment="Development work"
-    )
-
     # Create page with content
     page = make_confluence_page_with_content(
         title="Workflow Documentation",
@@ -256,12 +234,11 @@ def test_complex_workflow(
         labels=["workflow", "documentation"]
     )
 
-    # Test workflow with OAuth environment
-    workflow = ComplexWorkflow(issue, page)
+    # Test workflow with basic auth environment
+    workflow = ComplexWorkflow(page)
     result = workflow.execute()
 
     assert result.success
-    assert result.issue_key == "WORKFLOW-123"
     assert "Workflow Documentation" in result.documentation
 ```
 
@@ -269,35 +246,28 @@ def test_complex_workflow(
 
 ```python
 def test_real_api_integration(
-    jira_integration_client,
     confluence_integration_client,
-    use_real_jira_data,
     use_real_confluence_data
 ):
-    if not use_real_jira_data:
-        pytest.skip("Real Jira data not available")
-
     if not use_real_confluence_data:
         pytest.skip("Real Confluence data not available")
 
     # Test with real API clients
-    issues = jira_integration_client.search_issues("project = TEST")
     pages = confluence_integration_client.get_space_pages("TEST")
 
-    assert len(issues) >= 0
     assert len(pages) >= 0
 ```
 
 ## Conclusion
 
-The enhanced fixture system provides a powerful, flexible, and efficient foundation for testing the MCP Atlassian project. It maintains backward compatibility while offering significant improvements in performance, reusability, and developer experience.
+The enhanced fixture system provides a powerful, flexible, and efficient foundation for testing the Better Confluence MCP project. It maintains backward compatibility while offering significant improvements in performance, reusability, and developer experience.
 
 Key benefits:
 
-- ⚡ **Faster test execution** through session-scoped caching
-- 🔧 **More flexible test data** through factory functions
-- 🔄 **Better reusability** across test modules
-- 📈 **Improved maintainability** with clear separation of concerns
-- 🛡️ **Backward compatibility** with existing tests
+- **Faster test execution** through session-scoped caching
+- **More flexible test data** through factory functions
+- **Better reusability** across test modules
+- **Improved maintainability** with clear separation of concerns
+- **Backward compatibility** with existing tests
 
 For questions or suggestions about the fixture system, please refer to the test utilities documentation in `tests/utils/`.

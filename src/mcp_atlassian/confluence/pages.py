@@ -8,26 +8,12 @@ from requests.exceptions import HTTPError
 from ..exceptions import MCPAtlassianAuthenticationError
 from ..models.confluence import ConfluencePage
 from .client import ConfluenceClient
-from .v2_adapter import ConfluenceV2Adapter
 
 logger = logging.getLogger("mcp-atlassian")
 
 
 class PagesMixin(ConfluenceClient):
     """Mixin for Confluence page operations."""
-
-    @property
-    def _v2_adapter(self) -> ConfluenceV2Adapter | None:
-        """Get v2 API adapter for OAuth authentication.
-
-        Returns:
-            ConfluenceV2Adapter instance if OAuth is configured, None otherwise
-        """
-        if self.config.auth_type == "oauth" and self.config.is_cloud:
-            return ConfluenceV2Adapter(
-                session=self.confluence._session, base_url=self.confluence.url
-            )
-        return None
 
     def get_page_content(
         self, page_id: str, *, convert_to_markdown: bool = True
@@ -48,24 +34,11 @@ class PagesMixin(ConfluenceClient):
             Exception: If there is an error retrieving the page
         """
         try:
-            # Use v2 API for OAuth authentication, v1 API for token/basic auth
-            v2_adapter = self._v2_adapter
-            if v2_adapter:
-                logger.debug(
-                    f"Using v2 API for OAuth authentication to get page '{page_id}'"
-                )
-                page = v2_adapter.get_page(
-                    page_id=page_id,
-                    expand="body.storage,version,space,children.attachment",
-                )
-            else:
-                logger.debug(
-                    f"Using v1 API for token/basic authentication to get page '{page_id}'"
-                )
-                page = self.confluence.get_page_by_id(
-                    page_id=page_id,
-                    expand="body.storage,version,space,children.attachment",
-                )
+            logger.debug(f"Getting page content for page '{page_id}'")
+            page = self.confluence.get_page_by_id(
+                page_id=page_id,
+                expand="body.storage,version,space,children.attachment",
+            )
 
             space_key = page.get("space", {}).get("key", "")
             try:
@@ -334,30 +307,14 @@ class PagesMixin(ConfluenceClient):
                 final_body = body
                 representation = content_representation or "storage"
 
-            # Use v2 API for OAuth authentication, v1 API for token/basic auth
-            v2_adapter = self._v2_adapter
-            if v2_adapter:
-                logger.debug(
-                    f"Using v2 API for OAuth authentication to create page '{title}'"
-                )
-                result = v2_adapter.create_page(
-                    space_key=space_key,
-                    title=title,
-                    body=final_body,
-                    parent_id=parent_id,
-                    representation=representation,
-                )
-            else:
-                logger.debug(
-                    f"Using v1 API for token/basic authentication to create page '{title}'"
-                )
-                result = self.confluence.create_page(
-                    space=space_key,
-                    title=title,
-                    body=final_body,
-                    parent_id=parent_id,
-                    representation=representation,
-                )
+            logger.debug(f"Creating page '{title}' in space '{space_key}'")
+            result = self.confluence.create_page(
+                space=space_key,
+                title=title,
+                body=final_body,
+                parent_id=parent_id,
+                representation=representation,
+            )
 
             # Get the new page content
             page_id = result.get("id")
@@ -421,37 +378,20 @@ class PagesMixin(ConfluenceClient):
 
             logger.debug(f"Updating page {page_id} with title '{title}'")
 
-            # Use v2 API for OAuth authentication, v1 API for token/basic auth
-            v2_adapter = self._v2_adapter
-            if v2_adapter:
-                logger.debug(
-                    f"Using v2 API for OAuth authentication to update page '{page_id}'"
-                )
-                response = v2_adapter.update_page(
-                    page_id=page_id,
-                    title=title,
-                    body=final_body,
-                    representation=representation,
-                    version_comment=version_comment,
-                )
-            else:
-                logger.debug(
-                    f"Using v1 API for token/basic authentication to update page '{page_id}'"
-                )
-                update_kwargs = {
-                    "page_id": page_id,
-                    "title": title,
-                    "body": final_body,
-                    "type": "page",
-                    "representation": representation,
-                    "minor_edit": is_minor_edit,
-                    "version_comment": version_comment,
-                    "always_update": True,
-                }
-                if parent_id:
-                    update_kwargs["parent_id"] = parent_id
+            update_kwargs = {
+                "page_id": page_id,
+                "title": title,
+                "body": final_body,
+                "type": "page",
+                "representation": representation,
+                "minor_edit": is_minor_edit,
+                "version_comment": version_comment,
+                "always_update": True,
+            }
+            if parent_id:
+                update_kwargs["parent_id"] = parent_id
 
-                self.confluence.update_page(**update_kwargs)
+            self.confluence.update_page(**update_kwargs)
 
             # After update, refresh the page data
             return self.get_page_content(page_id)
@@ -550,39 +490,27 @@ class PagesMixin(ConfluenceClient):
         """
         try:
             logger.debug(f"Deleting page {page_id}")
+            response = self.confluence.remove_page(page_id=page_id)
 
-            # Use v2 API for OAuth authentication, v1 API for token/basic auth
-            v2_adapter = self._v2_adapter
-            if v2_adapter:
+            # The Atlassian library's remove_page returns the raw response from
+            # the REST API call. For a successful deletion, we should get a
+            # response object, but it might be empty (HTTP 204 No Content).
+            # For REST DELETE operations, a success typically returns 204 or 200
+
+            # Check if we got a response object
+            if isinstance(response, requests.Response):
+                # Check if status code indicates success (2xx)
+                success = 200 <= response.status_code < 300
                 logger.debug(
-                    f"Using v2 API for OAuth authentication to delete page '{page_id}'"
+                    f"Delete page {page_id} returned status code {response.status_code}"
                 )
-                return v2_adapter.delete_page(page_id=page_id)
-            else:
-                logger.debug(
-                    f"Using v1 API for token/basic authentication to delete page '{page_id}'"
-                )
-                response = self.confluence.remove_page(page_id=page_id)
-
-                # The Atlassian library's remove_page returns the raw response from
-                # the REST API call. For a successful deletion, we should get a
-                # response object, but it might be empty (HTTP 204 No Content).
-                # For REST DELETE operations, a success typically returns 204 or 200
-
-                # Check if we got a response object
-                if isinstance(response, requests.Response):
-                    # Check if status code indicates success (2xx)
-                    success = 200 <= response.status_code < 300
-                    logger.debug(
-                        f"Delete page {page_id} returned status code {response.status_code}"
-                    )
-                    return success
-                # If it's not a response object but truthy (like True), consider it a success
-                elif response:
-                    return True
-                # Default to true since no exception was raised
-                # This is safer than returning false when we don't know what happened
+                return success
+            # If it's not a response object but truthy (like True), consider it a success
+            elif response:
                 return True
+            # Default to true since no exception was raised
+            # This is safer than returning false when we don't know what happened
+            return True
 
         except Exception as e:
             logger.error(f"Error deleting page {page_id}: {str(e)}")

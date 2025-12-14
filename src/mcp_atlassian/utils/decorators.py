@@ -46,10 +46,10 @@ def check_write_access(func: F) -> F:
 
 def handle_atlassian_api_errors(service_name: str = "Atlassian API") -> Callable:
     """
-    Decorator to handle common Atlassian API exceptions (Jira, Confluence, etc.).
+    Decorator to handle common Atlassian API exceptions.
 
     Args:
-        service_name: Name of the service for error logging (e.g., "Jira API").
+        service_name: Name of the service for error logging (e.g., "Confluence API").
     """
 
     def decorator(func: Callable) -> Callable:

@@ -2,7 +2,6 @@
 
 import logging
 import re
-import warnings
 from typing import Any, Protocol
 
 from bs4 import BeautifulSoup, Tag
@@ -222,16 +221,3 @@ class BasePreprocessor:
         # Fallback: just use the account ID
         new_text = f"@user_{account_id}"
         user_element.replace_with(new_text)
-
-    def _convert_html_to_markdown(self, text: str) -> str:
-        """Convert HTML content to markdown if needed."""
-        if re.search(r"<[^>]+>", text):
-            try:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", category=UserWarning)
-                    soup = BeautifulSoup(f"<div>{text}</div>", "html.parser")
-                    html = str(soup.div.decode_contents()) if soup.div else text
-                    text = md(html)
-            except Exception as e:
-                logger.warning(f"Error converting HTML to markdown: {str(e)}")
-        return text
