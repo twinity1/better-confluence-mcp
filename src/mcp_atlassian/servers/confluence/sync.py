@@ -1,4 +1,4 @@
-"""Confluence sync tools - sync_space, reformat_local_html."""
+"""Confluence sync tools - sync_space."""
 
 import json
 import logging
@@ -13,7 +13,6 @@ from mcp_atlassian.local_storage import (
     cleanup_deleted_pages,
     load_space_metadata,
     merge_into_metadata,
-    reformat_space_html,
     remove_pages_from_metadata,
     save_page_html,
     save_space_metadata,
@@ -357,30 +356,3 @@ async def sync_space_impl(confluence_fetcher, space_key: str, full_sync: bool) -
             indent=2,
             ensure_ascii=False,
         )
-
-
-@confluence_mcp.tool(tags={"confluence", "local"})
-async def reformat_local_html(
-    ctx: Context,
-    space_key: Annotated[
-        str,
-        Field(description="The Confluence space key to reformat (e.g., 'DEV', 'IT')"),
-    ],
-) -> str:
-    """Reformat all local HTML files in a space by re-applying prettification.
-
-    This tool re-processes all locally cached HTML files to apply the latest
-    formatting rules (e.g., spacing fixes around inline tags like <strong>).
-
-    Use this after updating the MCP when new HTML formatting rules are added,
-    instead of re-syncing from Confluence.
-
-    Args:
-        ctx: The FastMCP context.
-        space_key: The key of the space to reformat.
-
-    Returns:
-        JSON string with reformat results.
-    """
-    result = reformat_space_html(space_key)
-    return json.dumps(result, indent=2, ensure_ascii=False)

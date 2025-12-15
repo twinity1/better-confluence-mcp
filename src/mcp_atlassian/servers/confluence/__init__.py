@@ -2,7 +2,7 @@
 
 This package contains the Confluence MCP server and tools organized into modules:
 - _server.py: FastMCP instance and shared utilities
-- sync.py: Space sync tools (sync_space, reformat_local_html)
+- sync.py: Space sync tools (sync_space)
 - pages.py: Page tools (read_page, create_page, push_page_update)
 - spaces.py: Space tools (get_spaces)
 - comments.py: Comment and user tools (get_comments, add_comment, search_user)
@@ -23,7 +23,7 @@ from .attachments import create_mermaid_diagram, download_attachments, upload_at
 from .comments import add_comment, get_comments, search_user
 from .pages import create_page, push_page_update, read_page
 from .spaces import get_spaces
-from .sync import reformat_local_html, sync_space, sync_space_impl
+from .sync import sync_space, sync_space_impl
 
 __all__ = [
     "confluence_mcp",
@@ -32,7 +32,6 @@ __all__ = [
     # Sync tools
     "sync_space",
     "sync_space_impl",
-    "reformat_local_html",
     # Page tools
     "read_page",
     "create_page",
