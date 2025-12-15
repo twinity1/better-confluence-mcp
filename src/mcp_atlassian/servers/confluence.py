@@ -443,6 +443,10 @@ async def read_page(
     After syncing, use standard file tools to read/edit the HTML files, then
     call push_page_update to push changes back to Confluence.
 
+    ## Finding Pages by ID
+
+    To find a page file by its ID, use glob: `.better-confluence-mcp/**/PAGE_ID/*.html`
+
     IMPORTANT:
     - Do NOT call multiple read_page or other sync tools in parallel.
     - Call them SEQUENTIALLY (one at a time).
