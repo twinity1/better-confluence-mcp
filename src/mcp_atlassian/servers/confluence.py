@@ -983,6 +983,18 @@ async def push_page_update(
       <ac:plain-text-body><![CDATA[your code here]]></ac:plain-text-body>
     </ac:structured-macro>
 
+    ## Diagrams with Mermaid
+
+    Requires `MERMAID_ENABLED=true` env var and `playwright install chromium`.
+
+    When creating diagrams:
+    1. Write mermaid source to a .mmd file (e.g., `diagram.mmd`)
+    2. Render: `from mermaid_cli import render_mermaid_file_sync; render_mermaid_file_sync("diagram.mmd", "diagram.png", "png")`
+    3. Upload BOTH files using `confluence_upload_attachment`
+    4. Reference inline: `<ac:image><ri:attachment ri:filename="diagram.png"/></ac:image>`
+
+    This ensures diagrams are editable (source in .mmd) and visible (rendered .png).
+
     Before updating, it verifies each page's local version matches Confluence.
 
     ## Moving and Reordering Pages (single page only)

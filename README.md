@@ -208,6 +208,7 @@ Each HTML file includes metadata in a comment header:
 | `READ_ONLY_MODE` | Disable write operations (default: false) |
 | `AUTO_SYNC_ON_STARTUP` | Auto-sync locally cached spaces on startup (default: true) |
 | `AUTO_ADD_GITIGNORE` | Auto-add storage directory to .gitignore (default: true) |
+| `MERMAID_ENABLED` | Enable mermaid diagram rendering (default: false). Requires `playwright install chromium` |
 
 ## Why "Better"?
 

@@ -37,6 +37,7 @@ dependencies = [
     "keyring>=25.6.0",
     "cachetools>=5.0.0",
     "types-cachetools>=5.5.0.20240820",
+    "mermaid-cli>=0.1.0",
 ]
 
 [[project.authors]]
@@ -150,6 +151,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "markdownify.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "mermaid_cli.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
