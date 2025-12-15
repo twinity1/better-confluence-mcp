@@ -48,6 +48,7 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 | `confluence_push_page_update` | Push changes to page(s) - supports bulk via comma-separated IDs |
 | `confluence_download_attachments` | Download all attachments from a page |
 | `confluence_upload_attachment` | Upload a file as attachment |
+| `confluence_create_mermaid_diagram` | Create mermaid diagram (.png) and upload to page |
 | `confluence_get_spaces` | List available spaces |
 | `confluence_get_comments` | Get comments for a page |
 | `confluence_add_comment` | Add a comment to a page |

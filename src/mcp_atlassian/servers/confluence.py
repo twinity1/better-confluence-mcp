@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -985,15 +986,9 @@ async def push_page_update(
 
     ## Diagrams with Mermaid
 
-    Requires `MERMAID_ENABLED=true` env var and `playwright install chromium`.
-
-    When creating diagrams:
-    1. Write mermaid source to a .mmd file (e.g., `diagram.mmd`)
-    2. Render: `from mermaid_cli import render_mermaid_file_sync; render_mermaid_file_sync("diagram.mmd", "diagram.png", "png")`
-    3. Upload BOTH files using `confluence_upload_attachment`
-    4. Reference inline: `<ac:image><ri:attachment ri:filename="diagram.png"/></ac:image>`
-
-    This ensures diagrams are editable (source in .mmd) and visible (rendered .png).
+    Use `confluence_create_mermaid_diagram` tool to create diagrams - it handles
+    rendering and uploading the .png image. Write the mermaid source directly
+    into the page content using an expand/code block (see tool docs for format).
 
     Before updating, it verifies each page's local version matches Confluence.
 
@@ -1411,12 +1406,14 @@ async def download_attachments(
     - Images: <ac:image><ri:attachment ri:filename="image.png"/></ac:image>
     - Links: <ac:link><ri:attachment ri:filename="file.pdf"/></ac:link>
 
+    Returns local paths to each file for easy reading/editing by the agent.
+
     Args:
         ctx: The FastMCP context.
         page_id: The ID of the page to download attachments from.
 
     Returns:
-        JSON string with list of downloaded files or error.
+        JSON with attachments_folder and list of downloaded files with local_path.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
@@ -1475,13 +1472,13 @@ async def download_attachments(
                     "filename": filename,
                     "size": attachment.get("extensions", {}).get("fileSize"),
                     "media_type": attachment.get("extensions", {}).get("mediaType"),
-                    "local_path": str(file_path.relative_to(Path.cwd())),
+                    "local_path": str(file_path.absolute()),
                 })
 
         result = {
             "success": True,
             "page_id": page_id,
-            "attachments_folder": str(attachments_folder.relative_to(Path.cwd())),
+            "attachments_folder": str(attachments_folder.absolute()),
             "total_attachments": len(attachments),
             "downloaded_count": downloaded_count,
             "downloaded": downloaded,
@@ -1595,6 +1592,179 @@ async def upload_attachment(
         logger.error(f"Failed to upload attachment to page {page_id}: {e}")
         return json.dumps(
             {"error": f"Failed to upload attachment: {str(e)}"},
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
+def _is_mermaid_enabled() -> bool:
+    """Check if mermaid diagram rendering is enabled via env var."""
+    return os.environ.get("MERMAID_ENABLED", "").lower() in ("true", "1", "yes")
+
+
+@confluence_mcp.tool(tags={"confluence", "write"})
+@check_write_access
+async def create_mermaid_diagram(
+    ctx: Context,
+    page_id: Annotated[
+        str,
+        Field(description="The ID of the page to attach the diagram to"),
+    ],
+    mermaid_source: Annotated[
+        str,
+        Field(description="The mermaid diagram source code (e.g., 'graph TD; A-->B')"),
+    ],
+    filename: Annotated[
+        str,
+        Field(description="Base filename without extension (e.g., 'architecture' creates architecture.png)"),
+    ],
+) -> str:
+    """Render a mermaid diagram to PNG and upload it as an attachment.
+
+    Requires `MERMAID_ENABLED=true` env var and `playwright install chromium`.
+
+    This tool renders the mermaid source to a PNG image and uploads it to Confluence.
+    The mermaid source should be embedded directly in the page content using an
+    expand/code block, NOT as a separate attachment.
+
+    ## Recommended Workflow
+
+    1. Call this tool with the mermaid source to create and upload the PNG
+    2. Add the image to the page using the HTML snippet from the response
+    3. Add the source below the image in an expand/code block for easy editing:
+
+    <ac:structured-macro ac:name="expand" ac:schema-version="1" data-layout="wide">
+      <ac:parameter ac:name="title">diagram-name.mmd</ac:parameter>
+      <ac:rich-text-body>
+        <ac:structured-macro ac:name="code" ac:schema-version="1">
+          <ac:plain-text-body><![CDATA[graph LR
+        A --> B]]></ac:plain-text-body>
+        </ac:structured-macro>
+      </ac:rich-text-body>
+    </ac:structured-macro>
+
+    ## Updating Existing Diagrams
+
+    To update an existing diagram:
+    1. Find and read the mermaid source from the expand/code block in the page HTML
+    2. Call this tool with the updated mermaid_source (same filename to overwrite PNG)
+    3. Update the source in the expand/code block in the page HTML
+
+    Args:
+        ctx: The FastMCP context.
+        page_id: The ID of the page to attach the diagram to.
+        mermaid_source: The mermaid diagram source code.
+        filename: Base filename without extension.
+
+    Returns:
+        JSON with success status and HTML snippet for inline embedding.
+    """
+    # Check if mermaid is enabled
+    if not _is_mermaid_enabled():
+        return json.dumps(
+            {
+                "error": "Mermaid diagram rendering is disabled.",
+                "hint": "Set MERMAID_ENABLED=true and run 'playwright install chromium' to enable.",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # Find the page in local storage
+    page_info = get_page_info(page_id)
+
+    if not page_info:
+        return json.dumps(
+            {
+                "error": f"Page '{page_id}' not found in local storage.",
+                "hint": "Use sync_space or read_page to sync the page first.",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    space_key = page_info["space_key"]
+    ancestors = page_info.get("ancestors", [])
+
+    # Ensure attachments folder exists
+    attachments_folder = ensure_attachments_folder(space_key, ancestors, page_id)
+
+    # Clean filename (remove extensions if provided)
+    base_name = filename.rsplit(".", 1)[0] if "." in filename else filename
+    mmd_filename = f"{base_name}.mmd"
+    png_filename = f"{base_name}.png"
+    mmd_path = attachments_folder / mmd_filename
+    png_path = attachments_folder / png_filename
+
+    try:
+        # Save mermaid source to .mmd file
+        mmd_path.write_text(mermaid_source, encoding="utf-8")
+
+        # Render to PNG using mermaid-cli (async version) with 2x scale for better quality
+        from mermaid_cli import render_mermaid_file
+
+        await render_mermaid_file(
+            str(mmd_path),
+            str(png_path),
+            "png",
+            viewport={"width": 800, "height": 600, "deviceScaleFactor": 2},
+        )
+
+        if not png_path.exists():
+            return json.dumps(
+                {"error": "Failed to render mermaid diagram - PNG not created."},
+                indent=2,
+                ensure_ascii=False,
+            )
+
+        # Upload PNG to Confluence
+        png_result = confluence_fetcher.confluence.attach_file(
+            filename=str(png_path),
+            page_id=page_id,
+            comment=f"Mermaid diagram: {base_name}",
+        )
+
+        # Build HTML snippet for inline embedding
+        html_snippet = f'<ac:image ac:align="center" ac:layout="center"><ri:attachment ri:filename="{png_filename}"/></ac:image>'
+
+        # Build expand/code block snippet for mermaid source
+        expand_snippet = f"""<ac:structured-macro ac:name="expand" ac:schema-version="1" data-layout="wide">
+  <ac:parameter ac:name="title">{base_name}.mmd</ac:parameter>
+  <ac:rich-text-body>
+    <ac:structured-macro ac:name="code" ac:schema-version="1">
+      <ac:plain-text-body><![CDATA[{mermaid_source}]]></ac:plain-text-body>
+    </ac:structured-macro>
+  </ac:rich-text-body>
+</ac:structured-macro>"""
+
+        return json.dumps(
+            {
+                "success": True,
+                "page_id": page_id,
+                "png_file": str(png_path),
+                "html_snippet": html_snippet,
+                "expand_snippet": expand_snippet,
+                "message": f"Successfully created and uploaded diagram '{base_name}.png'. Add html_snippet for the image and expand_snippet for the editable source.",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    except ImportError:
+        return json.dumps(
+            {
+                "error": "mermaid-cli not available.",
+                "hint": "Run 'playwright install chromium' to enable mermaid rendering.",
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        logger.error(f"Failed to create mermaid diagram for page {page_id}: {e}")
+        return json.dumps(
+            {"error": f"Failed to create mermaid diagram: {str(e)}"},
             indent=2,
             ensure_ascii=False,
         )

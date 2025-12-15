@@ -1,5 +1,16 @@
 # Project Guidelines
 
+## IMPORTANT: Git & Publishing Rules
+
+**NEVER execute these commands without explicit user permission:**
+- `git commit`
+- `git tag`
+- `git push`
+- `uv build`
+- `uv publish`
+
+Always show the user what you're about to do and wait for their explicit "go ahead" before executing.
+
 ## Project Overview
 
 This is **Better Confluence MCP** - an MCP server for Confluence with local filesystem caching. It's designed specifically for coding agents like Claude Code, Cursor, and similar AI assistants.
