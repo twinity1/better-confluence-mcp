@@ -61,9 +61,26 @@ def mock_confluence_fetcher():
 
     # Set up mock responses for each method
     mock_fetcher.search.return_value = [mock_page]
+    mock_fetcher.search_all.return_value = [mock_page]  # Used by incremental sync
     mock_fetcher.get_page_content.return_value = mock_page
     mock_fetcher.get_page_ancestors.return_value = [mock_ancestor]
     mock_fetcher.update_page.return_value = mock_page
+
+    # Mock for full sync - returns raw page dicts
+    mock_fetcher.get_all_space_pages_with_content.return_value = [{
+        "id": "123456",
+        "title": "Test Page Mock Title",
+        "body": {"storage": {"value": "<p>This is test page content</p>"}},
+        "version": {"number": 1},
+        "ancestors": [{"id": "111111"}],
+        "_links": {"webui": "/spaces/TEST/pages/123456/Test+Page"},
+        "space": {"key": "TEST", "name": "Test Space"},
+    }]
+
+    # Mock config for URL building
+    mock_config = MagicMock()
+    mock_config.url = "https://example.atlassian.net/wiki"
+    mock_fetcher.config = mock_config
 
     return mock_fetcher
 
@@ -122,9 +139,28 @@ async def client(test_confluence_mcp, mock_confluence_fetcher, tmp_path, monkeyp
     # Use temporary directory for storage
     monkeypatch.chdir(tmp_path)
 
-    with patch(
-        "src.mcp_atlassian.servers.confluence.get_confluence_fetcher",
-        AsyncMock(return_value=mock_confluence_fetcher),
+    # Patch all modules that import get_confluence_fetcher
+    with (
+        patch(
+            "src.mcp_atlassian.servers.confluence.sync.get_confluence_fetcher",
+            AsyncMock(return_value=mock_confluence_fetcher),
+        ),
+        patch(
+            "src.mcp_atlassian.servers.confluence.pages.get_confluence_fetcher",
+            AsyncMock(return_value=mock_confluence_fetcher),
+        ),
+        patch(
+            "src.mcp_atlassian.servers.confluence.spaces.get_confluence_fetcher",
+            AsyncMock(return_value=mock_confluence_fetcher),
+        ),
+        patch(
+            "src.mcp_atlassian.servers.confluence.comments.get_confluence_fetcher",
+            AsyncMock(return_value=mock_confluence_fetcher),
+        ),
+        patch(
+            "src.mcp_atlassian.servers.confluence.attachments.get_confluence_fetcher",
+            AsyncMock(return_value=mock_confluence_fetcher),
+        ),
     ):
         client_instance = Client(transport=FastMCPTransport(test_confluence_mcp))
         async with client_instance as connected_client:
@@ -136,9 +172,8 @@ async def test_sync_space(client, mock_confluence_fetcher, tmp_path):
     """Test the sync_space tool with basic space key."""
     response = await client.call_tool("confluence_sync_space", {"space_key": "TEST"})
 
-    mock_confluence_fetcher.search.assert_called_once()
-    mock_confluence_fetcher.get_page_content.assert_called_once()
-    mock_confluence_fetcher.get_page_ancestors.assert_called_once()
+    # Full sync (first sync) uses bulk fetch, not search
+    mock_confluence_fetcher.get_all_space_pages_with_content.assert_called_once_with("TEST")
 
     result_data = json.loads(response[0].text)
     assert result_data["success"] is True
@@ -154,7 +189,7 @@ async def test_sync_space(client, mock_confluence_fetcher, tmp_path):
 @pytest.mark.anyio
 async def test_sync_space_empty(client, mock_confluence_fetcher):
     """Test sync_space with no pages found."""
-    mock_confluence_fetcher.search.return_value = []
+    mock_confluence_fetcher.get_all_space_pages_with_content.return_value = []
 
     response = await client.call_tool(
         "confluence_sync_space", {"space_key": "EMPTY"}
@@ -168,10 +203,10 @@ async def test_sync_space_empty(client, mock_confluence_fetcher):
 @pytest.mark.anyio
 async def test_read_page(client, mock_confluence_fetcher, tmp_path):
     """Test the read_page tool."""
-    response = await client.call_tool("confluence_read_page", {"page_id": "123456"})
+    response = await client.call_tool("confluence_read_page", {"page_ids": "123456"})
 
-    mock_confluence_fetcher.get_page_content.assert_called()
-    mock_confluence_fetcher.get_page_ancestors.assert_called()
+    # read_page uses CQL search_all to get page info
+    mock_confluence_fetcher.search_all.assert_called()
 
     result_data = json.loads(response[0].text)
     assert result_data["success"] is True
@@ -188,30 +223,32 @@ async def test_read_page(client, mock_confluence_fetcher, tmp_path):
 @pytest.mark.anyio
 async def test_read_page_not_found(client, mock_confluence_fetcher):
     """Test read_page when page doesn't exist."""
-    mock_confluence_fetcher.get_page_content.side_effect = Exception("404 Not Found")
+    mock_confluence_fetcher.search_all.return_value = []
 
-    response = await client.call_tool("confluence_read_page", {"page_id": "nonexistent"})
+    response = await client.call_tool("confluence_read_page", {"page_ids": "nonexistent"})
 
     result_data = json.loads(response[0].text)
     assert "error" in result_data
-    assert "does not exist" in result_data["error"]
+    assert "not found" in result_data["error"].lower()
 
 
 @pytest.mark.anyio
 async def test_push_page_update(client, mock_confluence_fetcher, tmp_path):
     """Test push_page_update after syncing a page."""
     # First sync the page
-    await client.call_tool("confluence_read_page", {"page_id": "123456"})
+    await client.call_tool("confluence_read_page", {"page_ids": "123456"})
 
     # Now update it
     response = await client.call_tool(
         "confluence_push_page_update",
-        {"page_id": "123456", "revision_message": "Test update"},
+        {"page_ids": "123456", "revision_message": "Test update"},
     )
 
     result_data = json.loads(response[0].text)
-    assert result_data["success"] is True
-    assert result_data["page_id"] == "123456"
+    # Response is now a pages array
+    assert result_data["success_count"] == 1
+    assert result_data["pages"][0]["success"] is True
+    assert result_data["pages"][0]["page_id"] == "123456"
     assert result_data["revision_message"] == "Test update"
 
 
@@ -220,19 +257,19 @@ async def test_push_page_update_not_synced(client):
     """Test push_page_update when page is not in local storage."""
     response = await client.call_tool(
         "confluence_push_page_update",
-        {"page_id": "nonexistent", "revision_message": "Test update"},
+        {"page_ids": "nonexistent", "revision_message": "Test update"},
     )
 
     result_data = json.loads(response[0].text)
-    assert "error" in result_data
-    assert "not found in local storage" in result_data["error"]
+    assert result_data["pages"][0]["error"]
+    assert "not found in local storage" in result_data["pages"][0]["error"]
 
 
 @pytest.mark.anyio
 async def test_push_page_update_version_mismatch(client, mock_confluence_fetcher, tmp_path):
     """Test push_page_update when version has changed in Confluence."""
     # First sync the page (version 1)
-    await client.call_tool("confluence_read_page", {"page_id": "123456"})
+    await client.call_tool("confluence_read_page", {"page_ids": "123456"})
 
     # Simulate Confluence having a newer version (version 2)
     mock_version_v2 = MagicMock(spec=ConfluenceVersion)
@@ -251,14 +288,12 @@ async def test_push_page_update_version_mismatch(client, mock_confluence_fetcher
     # Try to update - should fail due to version mismatch
     response = await client.call_tool(
         "confluence_push_page_update",
-        {"page_id": "123456", "revision_message": "My update"},
+        {"page_ids": "123456", "revision_message": "My update"},
     )
 
     result_data = json.loads(response[0].text)
-    assert "error" in result_data
-    assert "modified externally" in result_data["error"]
-    assert result_data["local_version"] == 1
-    assert result_data["confluence_version"] == 2
+    assert result_data["pages"][0]["error"]
+    assert "mismatch" in result_data["pages"][0]["error"].lower()
 
 
 @pytest.mark.anyio

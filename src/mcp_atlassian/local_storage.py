@@ -259,6 +259,16 @@ def _prettify_element(element, indent_level: int = 0) -> str:
             )
             text_content = child.get_text().strip() if has_only_text else None
 
+            # Check if element contains only inline content (text + inline tags, no block elements)
+            def has_nested_blocks(el):
+                for c in el.children:
+                    if isinstance(c, Tag):
+                        if c.name.lower() in block_elements:
+                            return True
+                return False
+
+            has_block_children = has_nested_blocks(child)
+
             if is_block:
                 if has_only_text and text_content:
                     # Block element with only text: <p>text</p>
@@ -266,8 +276,12 @@ def _prettify_element(element, indent_level: int = 0) -> str:
                 elif not list(child.children):
                     # Self-closing or empty block element
                     result.append(f"\n{indent}<{child.name}{attrs_str}></{child.name}>")
+                elif not has_block_children:
+                    # Block element with only inline content: <p><strong>text</strong>:</p>
+                    inner = _prettify_element(child, indent_level)
+                    result.append(f"\n{indent}<{child.name}{attrs_str}>{inner}</{child.name}>")
                 else:
-                    # Block element with nested elements
+                    # Block element with nested block elements
                     inner = _prettify_element(child, indent_level + 1)
                     result.append(f"\n{indent}<{child.name}{attrs_str}>{inner}\n{indent}</{child.name}>")
             else:

@@ -7,6 +7,7 @@ from atlassian import Confluence
 
 from ..exceptions import MCPAtlassianAuthenticationError
 from ..utils.logging import get_masked_session_headers, log_config_param, mask_sensitive
+from ..utils.request_logging import install_request_logging
 from ..utils.ssl import configure_ssl_verification
 from .config import ConfluenceConfig
 
@@ -92,6 +93,9 @@ class ConfluenceClient:
         # Apply custom headers if configured
         if self.config.custom_headers:
             self._apply_custom_headers()
+
+        # Install request logging to track API calls
+        install_request_logging(self.confluence._session)
 
         # Import here to avoid circular imports
         from ..preprocessing.confluence import ConfluencePreprocessor
