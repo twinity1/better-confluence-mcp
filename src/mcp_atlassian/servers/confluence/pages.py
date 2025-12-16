@@ -49,9 +49,10 @@ async def read_page(
 
     ## Navigation Context
 
-    Returns breadcrumb and siblings for easy navigation:
+    Returns breadcrumb, siblings, and children for easy navigation:
     - **breadcrumb**: parent pages from root to immediate parent (with level, title, path)
     - **siblings**: pages at the same level (requested page marked with `requested: true`)
+    - **children**: direct child pages under this page
 
     ## Sync Behavior
 
@@ -75,7 +76,7 @@ async def read_page(
         page_ids: Single page ID or comma-separated list of page IDs.
 
     Returns:
-        JSON with page metadata, breadcrumb (parent pages), and siblings.
+        JSON with page metadata, breadcrumb (parent pages), siblings, and children.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
@@ -263,6 +264,18 @@ async def read_page(
                             sibling_entry["requested"] = True
                         siblings.append(sibling_entry)
 
+                # Find children (pages whose parent is the current page)
+                children = []
+                for other_id, other_data in new_metadata.page_index.items():
+                    other_ancestors = other_data.get("ancestors", [])
+                    other_parent = other_ancestors[-1] if other_ancestors else None
+                    if other_parent == page_id:
+                        children.append({
+                            "page_id": other_id,
+                            "title": other_data.get("title"),
+                            "local_path": other_data.get("path"),
+                        })
+
                 results.append({
                     "success": True,
                     "page_id": page_id,
@@ -275,6 +288,7 @@ async def read_page(
                     "absolute_path": str(Path.cwd() / page_data["path"]) if page_data.get("path") else None,
                     "breadcrumb": breadcrumb,
                     "siblings": siblings,
+                    "children": children,
                     "last_synced": page_data.get("last_synced"),
                 })
             else:
