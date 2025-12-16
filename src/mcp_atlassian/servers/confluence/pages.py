@@ -45,6 +45,12 @@ async def read_page(
     Supports bulk operations - pass multiple page IDs separated by commas.
     Pages are grouped by space and each space is synced once.
 
+    ## Navigation Context
+
+    Returns breadcrumb and siblings for easy navigation:
+    - **breadcrumb**: parent pages from root to immediate parent (with level, title, path)
+    - **siblings**: pages at the same level (requested page marked with `requested: true`)
+
     ## Sync Behavior
 
     The sync is incremental by default - only pages modified since the last sync
@@ -67,7 +73,7 @@ async def read_page(
         page_ids: Single page ID or comma-separated list of page IDs.
 
     Returns:
-        JSON with page metadata and local paths. For multiple pages, returns array of results.
+        JSON with page metadata, breadcrumb (parent pages), and siblings.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
@@ -163,6 +169,36 @@ async def read_page(
             page_id = page_info["page_id"]
             page_data = new_metadata.page_index.get(page_id) if new_metadata else None
             if page_data:
+                ancestors = page_data.get("ancestors", [])
+
+                # Build breadcrumb path with titles, paths, and level
+                breadcrumb = []
+                for level, ancestor_id in enumerate(ancestors, start=1):
+                    ancestor_data = new_metadata.page_index.get(ancestor_id)
+                    if ancestor_data:
+                        breadcrumb.append({
+                            "level": level,
+                            "page_id": ancestor_id,
+                            "title": ancestor_data.get("title"),
+                            "local_path": ancestor_data.get("path"),
+                        })
+
+                # Find siblings (pages with same parent), including current page
+                parent_id = ancestors[-1] if ancestors else None
+                siblings = []
+                for other_id, other_data in new_metadata.page_index.items():
+                    other_ancestors = other_data.get("ancestors", [])
+                    other_parent = other_ancestors[-1] if other_ancestors else None
+                    if other_parent == parent_id:
+                        sibling_entry = {
+                            "page_id": other_id,
+                            "title": other_data.get("title"),
+                            "local_path": other_data.get("path"),
+                        }
+                        if other_id == page_id:
+                            sibling_entry["requested"] = True
+                        siblings.append(sibling_entry)
+
                 results.append({
                     "success": True,
                     "page_id": page_id,
@@ -173,7 +209,8 @@ async def read_page(
                     "url": page_data.get("url"),
                     "local_path": page_data.get("path"),
                     "absolute_path": str(Path.cwd() / page_data["path"]) if page_data.get("path") else None,
-                    "ancestors": page_data.get("ancestors", []),
+                    "breadcrumb": breadcrumb,
+                    "siblings": siblings,
                     "last_synced": page_data.get("last_synced"),
                 })
             else:
