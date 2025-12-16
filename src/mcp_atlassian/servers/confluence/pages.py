@@ -12,8 +12,10 @@ from pydantic import Field
 
 from mcp_atlassian.local_storage import (
     SpaceMetadata,
+    check_and_cleanup_moved_page,
     get_page_info,
     load_space_metadata,
+    merge_into_metadata,
     save_page_html,
     save_space_metadata,
 )
@@ -162,6 +164,68 @@ async def read_page(
         async with space_lock:
             # Sync the space once using the unified sync function
             await sync_space_impl(confluence_fetcher, space_key, full_sync=False)
+
+        # Check if any requested pages have moved (ancestors changed)
+        # This catches moves that incremental sync might miss
+        existing_metadata = load_space_metadata(space_key)
+        moved_pages = []
+        for page_info in pages:
+            page_id = page_info["page_id"]
+            if page_info.get("from_local"):
+                continue  # Skip pages only found locally
+
+            try:
+                # Fetch current ancestors from Confluence
+                current_ancestors = confluence_fetcher.get_page_ancestors(page_id)
+                current_ancestor_ids = [a.id for a in current_ancestors] if current_ancestors else []
+
+                # Compare with local metadata
+                local_data = existing_metadata.page_index.get(page_id) if existing_metadata else None
+                local_ancestors = local_data.get("ancestors", []) if local_data else []
+
+                if current_ancestor_ids != local_ancestors:
+                    logger.info(f"Page {page_id} has moved: {local_ancestors} -> {current_ancestor_ids}")
+
+                    # Cleanup old location
+                    if check_and_cleanup_moved_page(space_key, page_id, current_ancestor_ids, existing_metadata):
+                        moved_pages.append(page_id)
+
+                    # Fetch full page and save to new location
+                    full_page = confluence_fetcher.get_page_content(page_id)
+                    if full_page:
+                        base_url = confluence_fetcher.config.url.rstrip("/")
+                        url = full_page.url or f"{base_url}/spaces/{space_key}/pages/{page_id}"
+                        version_num = full_page.version.number if full_page.version else None
+
+                        file_path = save_page_html(
+                            space_key=space_key,
+                            page_id=page_id,
+                            title=full_page.title,
+                            html_content=full_page.content or "",
+                            version=version_num,
+                            url=url,
+                            ancestors=current_ancestor_ids,
+                        )
+
+                        # Update metadata
+                        updated_page = {
+                            "page_id": page_id,
+                            "title": full_page.title,
+                            "version": version_num,
+                            "url": url,
+                            "path": file_path,
+                            "ancestors": current_ancestor_ids,
+                            "last_synced": datetime.now(timezone.utc).isoformat(),
+                        }
+                        existing_metadata = merge_into_metadata(
+                            existing_metadata, [updated_page], space_key,
+                            existing_metadata.space_name if existing_metadata else space_key
+                        )
+                        save_space_metadata(existing_metadata)
+                        logger.info(f"Page {page_id} moved and saved to new location: {file_path}")
+
+            except Exception as e:
+                logger.warning(f"Failed to check/move page {page_id}: {e}")
 
         # Get results for each page in this space from metadata
         new_metadata = load_space_metadata(space_key)
