@@ -34,6 +34,7 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 
 - **Fast & token-efficient editing** - Agents make surgical edits to local files instead of regenerating entire pages, saving tokens
 - **Large page support** - Edit pages of any size without context window limits
+- **Mermaid diagrams** - Render mermaid diagrams to PNG and embed them in pages
 - **Tree-based storage** - Folder structure matches Confluence hierarchy
 - **Incremental sync** - Only fetches pages modified since last sync (using CQL)
 - **Version conflict detection** - Prevents overwriting external edits
@@ -57,34 +58,8 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 
 ## Quick Start
 
-### 1. Install
+Add to **Claude Code** (`~/.claude.json`) or **Cursor** (Settings → MCP):
 
-```bash
-# Using pip
-pip install better-confluence-mcp
-
-# Or using uvx
-uvx better-confluence-mcp
-```
-
-### 2. Configure
-
-Set environment variables:
-
-```bash
-# For Confluence Cloud
-export CONFLUENCE_URL="https://your-company.atlassian.net/wiki"
-export CONFLUENCE_USERNAME="your.email@company.com"
-export CONFLUENCE_API_TOKEN="your_api_token"
-
-# For Confluence Server/Data Center
-export CONFLUENCE_URL="https://confluence.your-company.com"
-export CONFLUENCE_PERSONAL_TOKEN="your_pat_token"
-```
-
-### 3. Add to Your AI Assistant
-
-**Claude Code** (`~/.claude.json`):
 ```json
 {
   "mcpServers": {
@@ -94,24 +69,8 @@ export CONFLUENCE_PERSONAL_TOKEN="your_pat_token"
       "env": {
         "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
         "CONFLUENCE_USERNAME": "your.email@company.com",
-        "CONFLUENCE_API_TOKEN": "your_api_token"
-      }
-    }
-  }
-}
-```
-
-**Cursor** (Settings → MCP):
-```json
-{
-  "mcpServers": {
-    "confluence": {
-      "command": "uvx",
-      "args": ["better-confluence-mcp"],
-      "env": {
-        "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
-        "CONFLUENCE_USERNAME": "your.email@company.com",
-        "CONFLUENCE_API_TOKEN": "your_api_token"
+        "CONFLUENCE_API_TOKEN": "your_api_token",
+        "MERMAID_ENABLED": "true"
       }
     }
   }

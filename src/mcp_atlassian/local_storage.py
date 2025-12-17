@@ -149,6 +149,7 @@ def fix_html_spacing(html_content: str) -> str:
 
     Ensures space exists between text and inline formatting tags like <strong>, <em>, etc.
     Example: 'Click on<strong>Button</strong>' -> 'Click on <strong>Button</strong>'
+    Example: '</a>- text' -> '</a> - text'
     """
     # Inline formatting tags that typically need space before them
     inline_tags = r"(?:strong|em|b|i|u|code|span|a)"
@@ -166,6 +167,22 @@ def fix_html_spacing(html_content: str) -> str:
     # Match: </tag> + word char (no space between)
     html_content = re.sub(
         rf"(</{inline_tags}>)(\w)",
+        r"\1 \2",
+        html_content,
+        flags=re.IGNORECASE,
+    )
+
+    # Add space after closing tag if followed by dash (e.g., "</a>- text" -> "</a> - text")
+    html_content = re.sub(
+        rf"(</{inline_tags}>)(-)",
+        r"\1 \2",
+        html_content,
+        flags=re.IGNORECASE,
+    )
+
+    # Add space before opening tag if preceded by dash (e.g., "-<strong>" -> "- <strong>")
+    html_content = re.sub(
+        rf"(-)(<{inline_tags}[\s>])",
         r"\1 \2",
         html_content,
         flags=re.IGNORECASE,
@@ -221,9 +238,15 @@ def _prettify_element(element, indent_level: int = 0) -> str:
             if isinstance(child, CData):
                 result.append(f"<![CDATA[{child}]]>")
             else:
-                text = str(child).strip()
-                if text:
-                    result.append(text)
+                text = str(child)
+                # Collapse whitespace but preserve meaningful spaces
+                # First check if it's only whitespace (skip it)
+                if not text.strip():
+                    continue
+                # Normalize internal whitespace: collapse runs of whitespace to single space
+                import re
+                text = re.sub(r'\s+', ' ', text)
+                result.append(text)
         elif isinstance(child, Tag):
             tag_name = child.name.lower() if child.name else ''
             is_block = tag_name in block_elements
