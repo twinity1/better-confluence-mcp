@@ -699,12 +699,25 @@ async def push_page_update(
                 }
                 save_space_metadata(existing_metadata)
 
+            # Build diff URL for comparing versions
+            base_url = confluence_fetcher.config.url.rstrip("/")
+            diff_url = None
+            if local_version and version_num:
+                diff_url = (
+                    f"{base_url}/pages/diffpagesbyversion.action"
+                    f"?pageId={page_id}"
+                    f"&selectedPageVersions={local_version}"
+                    f"&selectedPageVersions={version_num}"
+                )
+
             results.append({
                 "success": True,
                 "page_id": page_id,
                 "title": updated_page.title,
+                "previous_version": local_version,
                 "new_version": version_num,
                 "url": updated_page.url,
+                "diff_url": diff_url,
             })
 
         except Exception as e:
