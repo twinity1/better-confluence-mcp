@@ -41,140 +41,155 @@ def is_gitignore_auto_add_enabled() -> bool:
     return val in ("true", "1", "yes")
 
 
-async def auto_sync_spaces_background(confluence_config: ConfluenceConfig) -> None:
-    """Sync all locally stored spaces in the background.
-
-    This runs after server startup to keep local caches up to date.
-    """
+def _sync_spaces_blocking(confluence_config: ConfluenceConfig, synced_spaces: list[str]) -> None:
+    """Synchronous sync operation to run in thread pool."""
     from datetime import datetime, timezone
 
     from mcp_atlassian.confluence import ConfluenceFetcher
 
+    fetcher = ConfluenceFetcher(confluence_config)
+
+    for space_key in synced_spaces:
+        try:
+            logger.info(f"Auto-syncing space: {space_key}")
+
+            existing_metadata = load_space_metadata(space_key)
+            if not existing_metadata:
+                logger.warning(f"No metadata for space {space_key}, skipping")
+                continue
+
+            # Check if we need full sync
+            full_sync = False
+            try:
+                last_dt = datetime.fromisoformat(
+                    existing_metadata.last_synced.replace("Z", "+00:00")
+                )
+                days_since_sync = (datetime.now(timezone.utc) - last_dt).days
+                if days_since_sync >= AUTO_FULL_SYNC_DAYS:
+                    full_sync = True
+                    logger.info(f"Space {space_key}: triggering full sync ({days_since_sync} days old)")
+            except (ValueError, AttributeError):
+                pass
+
+            saved_count = 0
+            all_page_ids: set[str] = set()
+
+            if full_sync:
+                # Use optimized bulk fetch for full sync
+                raw_pages = fetcher.get_all_space_pages_with_content(space_key)
+                if not raw_pages:
+                    logger.debug(f"Space {space_key}: no pages found")
+                    continue
+
+                for page in raw_pages:
+                    page_id = page.get("id")
+                    all_page_ids.add(page_id)
+                    try:
+                        title = page.get("title", "")
+                        body = page.get("body", {}).get("storage", {}).get("value", "")
+                        version = page.get("version", {}).get("number")
+                        ancestors = page.get("ancestors", [])
+                        ancestor_ids = [a.get("id") for a in ancestors]
+                        page_links = page.get("_links", {})
+                        web_ui = page_links.get("webui", "")
+                        base_url = fetcher.config.url.rstrip("/")
+                        url = f"{base_url}{web_ui}" if web_ui else ""
+
+                        check_and_cleanup_moved_page(
+                            space_key, page_id, ancestor_ids, existing_metadata
+                        )
+
+                        save_page_html(
+                            space_key=space_key,
+                            page_id=page_id,
+                            title=title,
+                            html_content=body,
+                            version=version,
+                            url=url,
+                            ancestors=ancestor_ids,
+                        )
+                        saved_count += 1
+                    except Exception as e:
+                        logger.debug(f"Failed to sync page {page_id}: {e}")
+
+                # Cleanup deleted pages
+                deleted = cleanup_deleted_pages(space_key, all_page_ids, existing_metadata)
+                if deleted:
+                    logger.debug(f"Space {space_key}: cleaned up {len(deleted)} deleted pages")
+            else:
+                # Incremental sync using CQL
+                cql_base = f'type=page AND space.key="{space_key}"'
+                last_dt = datetime.fromisoformat(
+                    existing_metadata.last_synced.replace("Z", "+00:00")
+                )
+                last_sync_date_str = last_dt.strftime("%Y-%m-%d %H:%M")
+                cql_query = f'{cql_base} AND lastModified >= "{last_sync_date_str}"'
+
+                search_results = fetcher.search_all(cql_query)
+                if not search_results:
+                    logger.debug(f"Space {space_key}: no changes since last sync")
+                    continue
+
+                for search_page in search_results:
+                    try:
+                        full_page = fetcher.get_page_content(
+                            search_page.id, convert_to_markdown=False
+                        )
+                        ancestors = fetcher.get_page_ancestors(search_page.id)
+                        ancestor_ids = [a.id for a in ancestors]
+
+                        check_and_cleanup_moved_page(
+                            space_key, search_page.id, ancestor_ids, existing_metadata
+                        )
+
+                        html_content = full_page.content or ""
+                        version_num = full_page.version.number if full_page.version else None
+                        save_page_html(
+                            space_key=space_key,
+                            page_id=search_page.id,
+                            title=full_page.title,
+                            html_content=html_content,
+                            version=version_num,
+                            url=full_page.url,
+                            ancestors=ancestor_ids,
+                        )
+                        saved_count += 1
+                    except Exception as e:
+                        logger.debug(f"Failed to sync page {search_page.id}: {e}")
+
+            logger.info(f"Auto-sync complete for {space_key}: {saved_count} pages updated")
+
+        except Exception as e:
+            logger.warning(f"Auto-sync failed for space {space_key}: {e}")
+
+
+def _start_daemon_sync(confluence_config: ConfluenceConfig, synced_spaces: list[str]) -> None:
+    """Start sync in a daemon thread that won't block process exit."""
+    import threading
+    thread = threading.Thread(
+        target=_sync_spaces_blocking,
+        args=(confluence_config, synced_spaces),
+        daemon=True,
+        name="auto-sync-background"
+    )
+    thread.start()
+
+
+async def auto_sync_spaces_background(confluence_config: ConfluenceConfig) -> None:
+    """Sync all locally stored spaces in the background.
+
+    This runs after server startup to keep local caches up to date.
+    Uses a daemon thread so it won't block server shutdown.
+    """
     synced_spaces = get_all_synced_spaces()
     if not synced_spaces:
         logger.debug("No locally synced spaces found, skipping auto-sync")
         return
 
-    logger.info(f"Auto-syncing {len(synced_spaces)} spaces: {synced_spaces}")
+    logger.info(f"Auto-syncing {len(synced_spaces)} spaces in background: {synced_spaces}")
 
-    try:
-        fetcher = ConfluenceFetcher(confluence_config)
-
-        for space_key in synced_spaces:
-            try:
-                logger.info(f"Auto-syncing space: {space_key}")
-
-                existing_metadata = load_space_metadata(space_key)
-                if not existing_metadata:
-                    logger.warning(f"No metadata for space {space_key}, skipping")
-                    continue
-
-                # Check if we need full sync
-                full_sync = False
-                try:
-                    last_dt = datetime.fromisoformat(
-                        existing_metadata.last_synced.replace("Z", "+00:00")
-                    )
-                    days_since_sync = (datetime.now(timezone.utc) - last_dt).days
-                    if days_since_sync >= AUTO_FULL_SYNC_DAYS:
-                        full_sync = True
-                        logger.info(f"Space {space_key}: triggering full sync ({days_since_sync} days old)")
-                except (ValueError, AttributeError):
-                    pass
-
-                saved_count = 0
-                all_page_ids: set[str] = set()
-
-                if full_sync:
-                    # Use optimized bulk fetch for full sync
-                    raw_pages = fetcher.get_all_space_pages_with_content(space_key)
-                    if not raw_pages:
-                        logger.debug(f"Space {space_key}: no pages found")
-                        continue
-
-                    for page in raw_pages:
-                        page_id = page.get("id")
-                        all_page_ids.add(page_id)
-                        try:
-                            title = page.get("title", "")
-                            body = page.get("body", {}).get("storage", {}).get("value", "")
-                            version = page.get("version", {}).get("number")
-                            ancestors = page.get("ancestors", [])
-                            ancestor_ids = [a.get("id") for a in ancestors]
-                            page_links = page.get("_links", {})
-                            web_ui = page_links.get("webui", "")
-                            base_url = fetcher.config.url.rstrip("/")
-                            url = f"{base_url}{web_ui}" if web_ui else ""
-
-                            check_and_cleanup_moved_page(
-                                space_key, page_id, ancestor_ids, existing_metadata
-                            )
-
-                            save_page_html(
-                                space_key=space_key,
-                                page_id=page_id,
-                                title=title,
-                                html_content=body,
-                                version=version,
-                                url=url,
-                                ancestors=ancestor_ids,
-                            )
-                            saved_count += 1
-                        except Exception as e:
-                            logger.debug(f"Failed to sync page {page_id}: {e}")
-
-                    # Cleanup deleted pages
-                    deleted = cleanup_deleted_pages(space_key, all_page_ids, existing_metadata)
-                    if deleted:
-                        logger.debug(f"Space {space_key}: cleaned up {len(deleted)} deleted pages")
-                else:
-                    # Incremental sync using CQL
-                    cql_base = f'type=page AND space.key="{space_key}"'
-                    last_dt = datetime.fromisoformat(
-                        existing_metadata.last_synced.replace("Z", "+00:00")
-                    )
-                    last_sync_date_str = last_dt.strftime("%Y-%m-%d %H:%M")
-                    cql_query = f'{cql_base} AND lastModified >= "{last_sync_date_str}"'
-
-                    search_results = fetcher.search_all(cql_query)
-                    if not search_results:
-                        logger.debug(f"Space {space_key}: no changes since last sync")
-                        continue
-
-                    for search_page in search_results:
-                        try:
-                            full_page = fetcher.get_page_content(
-                                search_page.id, convert_to_markdown=False
-                            )
-                            ancestors = fetcher.get_page_ancestors(search_page.id)
-                            ancestor_ids = [a.id for a in ancestors]
-
-                            check_and_cleanup_moved_page(
-                                space_key, search_page.id, ancestor_ids, existing_metadata
-                            )
-
-                            html_content = full_page.content or ""
-                            version_num = full_page.version.number if full_page.version else None
-                            save_page_html(
-                                space_key=space_key,
-                                page_id=search_page.id,
-                                title=full_page.title,
-                                html_content=html_content,
-                                version=version_num,
-                                url=full_page.url,
-                                ancestors=ancestor_ids,
-                            )
-                            saved_count += 1
-                        except Exception as e:
-                            logger.debug(f"Failed to sync page {search_page.id}: {e}")
-
-                logger.info(f"Auto-sync complete for {space_key}: {saved_count} pages updated")
-
-            except Exception as e:
-                logger.warning(f"Auto-sync failed for space {space_key}: {e}")
-
-    except Exception as e:
-        logger.error(f"Auto-sync initialization failed: {e}")
+    # Start sync in daemon thread (won't block process exit)
+    _start_daemon_sync(confluence_config, synced_spaces)
 
 
 @asynccontextmanager
@@ -217,14 +232,12 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
             logger.warning(f"Failed to update .gitignore: {e}")
 
     # Start auto-sync in background if enabled and configured
-    auto_sync_task: asyncio.Task | None = None
     if is_auto_sync_enabled() and loaded_confluence_config:
         synced_spaces = get_all_synced_spaces()
         if synced_spaces:
             logger.info(f"Starting background auto-sync for spaces: {synced_spaces}")
-            auto_sync_task = asyncio.create_task(
-                auto_sync_spaces_background(loaded_confluence_config)
-            )
+            # Run in daemon thread (doesn't block shutdown)
+            await auto_sync_spaces_background(loaded_confluence_config)
 
     try:
         yield {"app_lifespan_context": app_context}
@@ -233,14 +246,7 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
         raise
     finally:
         logger.info("Main Atlassian MCP server lifespan shutting down...")
-        # Cancel auto-sync task if running
-        if auto_sync_task and not auto_sync_task.done():
-            logger.debug("Cancelling background auto-sync task...")
-            auto_sync_task.cancel()
-            try:
-                await auto_sync_task
-            except asyncio.CancelledError:
-                pass
+        # Auto-sync runs in daemon thread - no cleanup needed
         # Perform any necessary cleanup here
         try:
             if loaded_confluence_config:
