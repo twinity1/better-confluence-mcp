@@ -13,6 +13,7 @@ from pydantic import Field
 from mcp_atlassian.local_storage import (
     SpaceMetadata,
     check_and_cleanup_moved_page,
+    fix_html_spacing,
     get_page_info,
     load_space_metadata,
     merge_into_metadata,
@@ -652,6 +653,9 @@ async def push_page_update(
                     if title_match:
                         page_title = title_match.group(1).strip()
                     content = content[end_comment + 3:].lstrip("\n")
+
+            # Fix spacing around inline tags (agents often write without proper spacing)
+            content = fix_html_spacing(content)
 
             # Update page in Confluence
             updated_page = confluence_fetcher.update_page(
