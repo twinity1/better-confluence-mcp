@@ -44,7 +44,6 @@ The folder structure mirrors the Confluence page hierarchy. Each page is stored 
 | Tool | Description |
 |------|-------------|
 | `confluence_sync_space` | Sync a Confluence space to local filesystem |
-| `confluence_reformat_local_html` | Re-apply HTML formatting to local files (spacing fixes) |
 | `confluence_read_page` | Read page(s) - supports bulk via comma-separated IDs |
 | `confluence_create_page` | Create page(s) - supports bulk via comma-separated titles |
 | `confluence_push_page_update` | Push changes to page(s) - supports bulk via comma-separated IDs |
