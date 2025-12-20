@@ -11,6 +11,10 @@
 
 Always show the user what you're about to do and wait for their explicit "go ahead" before executing.
 
+## Development Workflow
+
+**After modifying MCP server code**: You must wait for the user to restart Claude Code before calling the updated MCP tools. The MCP server runs as a subprocess and code changes are not reflected until restart.
+
 ## Project Overview
 
 This is **Better Confluence MCP** - an MCP server for Confluence with local filesystem caching. It's designed specifically for coding agents like Claude Code, Cursor, and similar AI assistants.

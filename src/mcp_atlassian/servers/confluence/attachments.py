@@ -157,10 +157,12 @@ async def upload_attachment(
        - For file links: <ac:link><ri:attachment ri:filename="file.pdf"/></ac:link>
     3. Push the changes using push_page_update
 
-    Example image with alignment:
-    <ac:image ac:align="center" ac:layout="center">
+    Example image with full container width (recommended):
+    <ac:image ac:align="center" ac:layout="center" ac:width="736">
       <ri:attachment ri:filename="screenshot.png"/>
     </ac:image>
+
+    Note: Use ac:width="736" for images to display at 100% container width.
 
     Args:
         ctx: The FastMCP context.
@@ -257,7 +259,8 @@ async def create_mermaid_diagram(
 
     Requires `MERMAID_ENABLED=true` env var and `playwright install chromium`.
 
-    This tool renders the mermaid source to a PNG image and uploads it to Confluence.
+    This tool renders the mermaid source to a high-quality PNG image (8x scale
+    for crisp text) and uploads it to Confluence.
     The mermaid source should be embedded directly in the page content using an
     expand/code block, NOT as a separate attachment.
 
@@ -283,6 +286,12 @@ async def create_mermaid_diagram(
     1. Find and read the mermaid source from the expand/code block in the page HTML
     2. Call this tool with the updated mermaid_source (same filename to overwrite PNG)
     3. Update the source in the expand/code block in the page HTML
+
+    ## Line Breaks in Node Labels
+
+    Use `<br>` for line breaks in mermaid node labels, NOT `\\n`:
+    - Correct: `Node["Line 1<br>Line 2"]`
+    - Wrong: `Node["Line 1\\nLine 2"]`
 
     Args:
         ctx: The FastMCP context.
@@ -336,15 +345,24 @@ async def create_mermaid_diagram(
         # Save mermaid source to .mmd file
         mmd_path.write_text(mermaid_source, encoding="utf-8")
 
-        # Render to PNG using mermaid-cli (async version) with 2x scale for better quality
-        from mermaid_cli import render_mermaid_file
+        # Render to PNG using mermaid-cli with high quality (8x scale for crisp text)
+        # PNG is used because Confluence Cloud's API-uploaded SVGs don't render text
+        # correctly (the UI uses a different Media Services flow not available via API)
+        from mermaid_cli import render_mermaid
 
-        await render_mermaid_file(
-            str(mmd_path),
-            str(png_path),
-            "png",
-            viewport={"width": 800, "height": 600, "deviceScaleFactor": 2},
+        # Scale viewport based on diagram complexity (number of lines)
+        line_count = len(mermaid_source.strip().split("\n"))
+        # Base: 1920x1080 for ~20 lines, scale up for larger diagrams
+        scale_factor = max(1.0, line_count / 20)
+        viewport_width = int(1920 * scale_factor)
+        viewport_height = int(1080 * scale_factor)
+
+        _, _, png_bytes = await render_mermaid(
+            mermaid_source,
+            output_format="png",
+            viewport={"width": viewport_width, "height": viewport_height, "deviceScaleFactor": 8},
         )
+        png_path.write_bytes(png_bytes)
 
         if not png_path.exists():
             return json.dumps(
@@ -361,7 +379,7 @@ async def create_mermaid_diagram(
         )
 
         # Build HTML snippet for inline embedding
-        html_snippet = f'<ac:image ac:align="center" ac:layout="center"><ri:attachment ri:filename="{png_filename}"/></ac:image>'
+        html_snippet = f'<ac:image ac:align="center" ac:alt="{png_filename}" ac:layout="center" ac:width="736"><ri:attachment ri:filename="{png_filename}"></ri:attachment></ac:image>'
 
         # Build expand/code block snippet for mermaid source
         expand_snippet = f"""<ac:structured-macro ac:name="expand" ac:schema-version="1" data-layout="wide">
