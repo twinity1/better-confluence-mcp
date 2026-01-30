@@ -536,6 +536,11 @@ async def push_page_update(
       <ac:plain-text-body><![CDATA[your code here]]></ac:plain-text-body>
     </ac:structured-macro>
 
+    ## Table Cell Background Color
+
+    To set a background color on a table cell, use the `data-highlight-colour` attribute:
+    <td data-highlight-colour="#e3fcef">Cell content</td>
+
     ## Diagrams with Mermaid
 
     Use `confluence_create_mermaid_diagram` tool to create diagrams - it handles
