@@ -78,3 +78,4 @@ playground/
 
 # Local Confluence cache
 .better-confluence-mcp/
+.playwright-mcp

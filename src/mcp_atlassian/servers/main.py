@@ -19,6 +19,7 @@ from mcp_atlassian.local_storage import (
     cleanup_deleted_pages,
     check_and_cleanup_moved_page,
 )
+from mcp_atlassian.utils.env import is_env_ssl_verify
 from mcp_atlassian.utils.environment import get_available_services
 from mcp_atlassian.utils.io import is_read_only_mode
 from mcp_atlassian.utils.tools import get_enabled_tools, should_include_tool
@@ -201,7 +202,33 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
 
     loaded_confluence_config: ConfluenceConfig | None = None
 
-    if services.get("confluence"):
+    # Transport mode is set via environment variable by the CLI
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+
+    if transport == "streamable-http":
+        # HTTP mode: only need CONFLUENCE_URL from env, auth comes from request headers
+        # Force read-only mode
+        read_only = True
+        confluence_url = os.environ.get("CONFLUENCE_URL")
+        if confluence_url:
+            try:
+                # Create a config with URL only (auth will be per-request from headers)
+                loaded_confluence_config = ConfluenceConfig(
+                    url=confluence_url,
+                    auth_type="basic",
+                    username="placeholder",
+                    api_token="placeholder",
+                    ssl_verify=is_env_ssl_verify("CONFLUENCE_SSL_VERIFY"),
+                    spaces_filter=os.environ.get("CONFLUENCE_SPACES_FILTER"),
+                )
+                logger.info(
+                    "HTTP mode: Confluence URL configured. Auth will come from request headers."
+                )
+            except Exception as e:
+                logger.error(f"Failed to create Confluence config: {e}", exc_info=True)
+        else:
+            logger.error("HTTP mode requires CONFLUENCE_URL environment variable.")
+    elif services.get("confluence"):
         try:
             confluence_config = ConfluenceConfig.from_env()
             if confluence_config.is_auth_configured():
@@ -220,7 +247,9 @@ async def main_lifespan(app: FastMCP[MainAppContext]) -> AsyncIterator[dict]:
         full_confluence_config=loaded_confluence_config,
         read_only=read_only,
         enabled_tools=enabled_tools,
+        transport=transport,
     )
+    logger.info(f"Transport: {transport}")
     logger.info(f"Read-only mode: {'ENABLED' if read_only else 'DISABLED'}")
     logger.info(f"Enabled tools filter: {enabled_tools or 'All tools enabled'}")
 
@@ -284,8 +313,13 @@ class AtlassianMCP(FastMCP[MainAppContext]):
             if app_lifespan_state
             else None
         )
+        transport = (
+            getattr(app_lifespan_state, "transport", "stdio")
+            if app_lifespan_state
+            else "stdio"
+        )
         logger.debug(
-            f"_main_mcp_list_tools: read_only={read_only}, enabled_tools_filter={enabled_tools_filter}"
+            f"_main_mcp_list_tools: read_only={read_only}, enabled_tools_filter={enabled_tools_filter}, transport={transport}"
         )
 
         all_tools: dict[str, FastMCPTool] = await self.get_tools()
@@ -304,6 +338,13 @@ class AtlassianMCP(FastMCP[MainAppContext]):
             if tool_obj and read_only and "write" in tool_tags:
                 logger.debug(
                     f"Excluding tool '{registered_name}' due to read-only mode and 'write' tag"
+                )
+                continue
+
+            # Exclude http_only tools when running in stdio mode
+            if "http_only" in tool_tags and transport != "streamable-http":
+                logger.debug(
+                    f"Excluding tool '{registered_name}' (http_only, transport={transport})"
                 )
                 continue
 

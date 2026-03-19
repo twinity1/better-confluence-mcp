@@ -71,6 +71,23 @@ logger = setup_logging(logging_level, logging_stream)
     "--enabled-tools",
     help="Comma-separated list of tools to enable (enables all if not specified)",
 )
+@click.option(
+    "--transport",
+    type=click.Choice(["stdio", "streamable-http"]),
+    default="stdio",
+    help="Transport mode: stdio (default) or streamable-http",
+)
+@click.option(
+    "--port",
+    type=int,
+    default=8000,
+    help="Port for HTTP transport (default: 8000)",
+)
+@click.option(
+    "--host",
+    default="0.0.0.0",
+    help="Host for HTTP transport (default: 0.0.0.0)",
+)
 def main(
     verbose: int,
     env_file: str | None,
@@ -82,6 +99,9 @@ def main(
     confluence_spaces_filter: str | None,
     read_only: bool,
     enabled_tools: str | None,
+    transport: str,
+    port: int,
+    host: str,
 ) -> None:
     """MCP Atlassian Server - Confluence functionality for MCP
 
@@ -151,16 +171,33 @@ def main(
     if click_ctx and was_option_provided(click_ctx, "confluence_spaces_filter"):
         os.environ["CONFLUENCE_SPACES_FILTER"] = confluence_spaces_filter
 
+    # Set transport mode in env for the lifespan context
+    os.environ["MCP_TRANSPORT"] = transport
+
     from mcp_atlassian.servers import main_mcp
 
     # Set up signal handlers for graceful shutdown
     setup_signal_handlers()
 
-    logger.info("Starting server with STDIO transport.")
+    logger.info(f"Starting server with {transport.upper()} transport.")
 
     try:
         logger.debug("Starting asyncio event loop...")
-        asyncio.run(main_mcp.run_async(transport="stdio"))
+        if transport == "streamable-http":
+            import uvicorn
+            from starlette.middleware import Middleware
+
+            from mcp_atlassian.servers.http_auth import ConfluenceAuthMiddleware
+
+            middleware = [Middleware(ConfluenceAuthMiddleware)]
+            app = main_mcp.streamable_http_app(middleware=middleware)
+            asyncio.run(
+                uvicorn.Server(
+                    uvicorn.Config(app, host=host, port=port, log_level="info")
+                ).serve()
+            )
+        else:
+            asyncio.run(main_mcp.run_async(transport="stdio"))
     except (KeyboardInterrupt, SystemExit) as e:
         logger.info(f"Server shutdown initiated: {type(e).__name__}")
     except Exception as e:

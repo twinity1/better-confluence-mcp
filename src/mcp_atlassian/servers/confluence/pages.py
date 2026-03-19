@@ -20,7 +20,7 @@ from mcp_atlassian.local_storage import (
     save_page_html,
     save_space_metadata,
 )
-from mcp_atlassian.servers.dependencies import get_confluence_fetcher
+from mcp_atlassian.servers.dependencies import get_confluence_fetcher, get_transport_from_context
 from mcp_atlassian.utils.decorators import check_write_access
 
 from ._server import confluence_mcp, get_space_lock
@@ -80,6 +80,7 @@ async def read_page(
         JSON with page metadata, breadcrumb (parent pages), siblings, and children.
     """
     confluence_fetcher = await get_confluence_fetcher(ctx)
+    is_http_mode = get_transport_from_context(ctx) == "streamable-http"
 
     # Parse page IDs (comma-separated)
     id_list = [pid.strip() for pid in page_ids.split(",") if pid.strip()]
@@ -277,7 +278,7 @@ async def read_page(
                             "local_path": other_data.get("path"),
                         })
 
-                results.append({
+                result_entry = {
                     "success": True,
                     "page_id": page_id,
                     "title": page_data.get("title"),
@@ -291,7 +292,25 @@ async def read_page(
                     "siblings": siblings,
                     "children": children,
                     "last_synced": page_data.get("last_synced"),
-                })
+                }
+
+                # In HTTP mode, include the full page content since the client
+                # cannot access local files
+                if is_http_mode and page_data.get("path"):
+                    try:
+                        content_path = Path.cwd() / page_data["path"]
+                        if content_path.exists():
+                            raw_content = content_path.read_text(encoding="utf-8")
+                            # Strip the metadata comment header
+                            if raw_content.startswith("<!--"):
+                                end_comment = raw_content.find("-->")
+                                if end_comment != -1:
+                                    raw_content = raw_content[end_comment + 3:].lstrip("\n")
+                            result_entry["content"] = raw_content
+                    except Exception as e:
+                        logger.warning(f"Failed to read content for page {page_id}: {e}")
+
+                results.append(result_entry)
             else:
                 results.append({
                     "page_id": page_id,

@@ -18,3 +18,4 @@ class MainAppContext:
     full_confluence_config: ConfluenceConfig | None = None
     read_only: bool = False
     enabled_tools: list[str] | None = None
+    transport: str = "stdio"

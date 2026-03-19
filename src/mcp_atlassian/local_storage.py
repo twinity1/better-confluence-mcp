@@ -319,8 +319,25 @@ def _prettify_element(element, indent_level: int = 0) -> str:
 
 
 def get_storage_path() -> Path:
-    """Get the base storage path."""
-    return Path.cwd() / LOCAL_STORAGE_DIR
+    """Get the base storage path.
+
+    In HTTP mode this is namespaced per-user to isolate synced data
+    (e.g. .better-confluence-mcp/_users/a1b2c3_ales.kutek/).
+    In stdio mode returns the shared root.
+    """
+    base = Path.cwd() / LOCAL_STORAGE_DIR
+
+    # Import here to avoid circular imports and keep stdio mode zero-cost
+    try:
+        from mcp_atlassian.servers.http_auth import get_user_storage_namespace
+        namespace = get_user_storage_namespace()
+    except ImportError:
+        namespace = None
+
+    if namespace:
+        return base / "_users" / namespace
+
+    return base
 
 
 def ensure_gitignore_entry(auto_add: bool = True) -> None:
