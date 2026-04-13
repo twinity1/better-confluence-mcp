@@ -10,7 +10,6 @@ from pydantic import Field
 
 from mcp_atlassian.local_storage import (
     ensure_attachments_folder,
-    get_base_dir,
     get_page_info,
 )
 from mcp_atlassian.servers.dependencies import get_confluence_fetcher
@@ -178,7 +177,7 @@ async def upload_attachment(
     # Resolve the file path
     local_file = Path(file_path)
     if not local_file.is_absolute():
-        local_file = get_base_dir() / file_path
+        local_file = Path.cwd() / file_path
 
     if not local_file.exists():
         return json.dumps(
