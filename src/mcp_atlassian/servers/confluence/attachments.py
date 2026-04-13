@@ -2,7 +2,6 @@
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Annotated
 
@@ -11,6 +10,7 @@ from pydantic import Field
 
 from mcp_atlassian.local_storage import (
     ensure_attachments_folder,
+    get_base_dir,
     get_page_info,
 )
 from mcp_atlassian.servers.dependencies import get_confluence_fetcher
@@ -178,7 +178,7 @@ async def upload_attachment(
     # Resolve the file path
     local_file = Path(file_path)
     if not local_file.is_absolute():
-        local_file = Path.cwd() / file_path
+        local_file = get_base_dir() / file_path
 
     if not local_file.exists():
         return json.dumps(
@@ -233,9 +233,25 @@ async def upload_attachment(
         )
 
 
-def _is_mermaid_enabled() -> bool:
-    """Check if mermaid diagram rendering is enabled via env var."""
-    return os.environ.get("MERMAID_ENABLED", "").lower() in ("true", "1", "yes")
+MERMAID_INK_BASE_URL = "https://mermaid.ink"
+
+
+async def _render_mermaid_png(mermaid_source: str) -> bytes:
+    """Render Mermaid source to PNG bytes via mermaid.ink API.
+
+    No local dependencies required — uses the free mermaid.ink service.
+    """
+    import base64
+
+    import httpx
+
+    encoded = base64.urlsafe_b64encode(mermaid_source.encode("utf-8")).decode("ascii")
+    url = f"{MERMAID_INK_BASE_URL}/img/{encoded}?type=png"
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.content
 
 
 @confluence_mcp.tool(tags={"confluence", "write"})
@@ -257,12 +273,12 @@ async def create_mermaid_diagram(
 ) -> str:
     """Render a mermaid diagram to PNG and upload it as an attachment.
 
-    Requires `MERMAID_ENABLED=true` env var and `playwright install chromium`.
+    Uses the mermaid.ink service to render diagrams — no local browser or
+    CLI tools required.
 
-    This tool renders the mermaid source to a high-quality PNG image (8x scale
-    for crisp text) and uploads it to Confluence.
-    The mermaid source should be embedded directly in the page content using an
-    expand/code block, NOT as a separate attachment.
+    This tool renders the mermaid source to a PNG image and uploads it to
+    Confluence. The mermaid source should be embedded directly in the page
+    content using an expand/code block, NOT as a separate attachment.
 
     ## Recommended Workflow
 
@@ -302,17 +318,6 @@ async def create_mermaid_diagram(
     Returns:
         JSON with success status and HTML snippet for inline embedding.
     """
-    # Check if mermaid is enabled
-    if not _is_mermaid_enabled():
-        return json.dumps(
-            {
-                "error": "Mermaid diagram rendering is disabled.",
-                "hint": "Set MERMAID_ENABLED=true and run 'playwright install chromium' to enable.",
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-
     confluence_fetcher = await get_confluence_fetcher(ctx)
 
     # Find the page in local storage
@@ -345,31 +350,9 @@ async def create_mermaid_diagram(
         # Save mermaid source to .mmd file
         mmd_path.write_text(mermaid_source, encoding="utf-8")
 
-        # Render to PNG using mermaid-cli with high quality (8x scale for crisp text)
-        # PNG is used because Confluence Cloud's API-uploaded SVGs don't render text
-        # correctly (the UI uses a different Media Services flow not available via API)
-        from mermaid_cli import render_mermaid
-
-        # Scale viewport based on diagram complexity (number of lines)
-        line_count = len(mermaid_source.strip().split("\n"))
-        # Base: 1920x1080 for ~20 lines, scale up for larger diagrams
-        scale_factor = max(1.0, line_count / 20)
-        viewport_width = int(1920 * scale_factor)
-        viewport_height = int(1080 * scale_factor)
-
-        _, _, png_bytes = await render_mermaid(
-            mermaid_source,
-            output_format="png",
-            viewport={"width": viewport_width, "height": viewport_height, "deviceScaleFactor": 8},
-        )
+        # Render to PNG via mermaid.ink (no local browser/CLI dependencies)
+        png_bytes = await _render_mermaid_png(mermaid_source)
         png_path.write_bytes(png_bytes)
-
-        if not png_path.exists():
-            return json.dumps(
-                {"error": "Failed to render mermaid diagram - PNG not created."},
-                indent=2,
-                ensure_ascii=False,
-            )
 
         # Upload PNG to Confluence
         confluence_fetcher.confluence.attach_file(
@@ -404,15 +387,6 @@ async def create_mermaid_diagram(
             ensure_ascii=False,
         )
 
-    except ImportError:
-        return json.dumps(
-            {
-                "error": "mermaid-cli not available.",
-                "hint": "Run 'playwright install chromium' to enable mermaid rendering.",
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
     except Exception as e:
         logger.error(f"Failed to create mermaid diagram for page {page_id}: {e}")
         return json.dumps(

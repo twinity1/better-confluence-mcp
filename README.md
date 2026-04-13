@@ -195,7 +195,6 @@ Add to **Claude Code** (`~/.claude.json`) or **Cursor** (Settings → MCP):
         "CONFLUENCE_URL": "https://your-company.atlassian.net/wiki",
         "CONFLUENCE_USERNAME": "your.email@company.com",
         "CONFLUENCE_API_TOKEN": "your_api_token",
-        "MERMAID_ENABLED": "true"
       }
     }
   }
@@ -352,7 +351,6 @@ Each HTML file includes metadata in a comment header:
 | `READ_ONLY_MODE` | Disable write operations (default: false; always true in HTTP mode) |
 | `AUTO_SYNC_ON_STARTUP` | Auto-sync locally cached spaces on startup (default: true) |
 | `AUTO_ADD_GITIGNORE` | Auto-add storage directory to .gitignore (default: true) |
-| `MERMAID_ENABLED` | Enable mermaid diagram rendering (default: false). Requires `playwright install chromium` |
 
 ### CLI Options
 
