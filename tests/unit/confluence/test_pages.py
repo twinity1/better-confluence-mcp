@@ -472,6 +472,44 @@ class TestPagesMixin:
         with pytest.raises(Exception, match="Failed to delete page"):
             pages_mixin.delete_page(page_id)
 
+    @pytest.mark.parametrize(
+        ("position", "expected_api_position"),
+        [
+            ("before", "above"),
+            ("after", "below"),
+            ("append", "append"),
+        ],
+    )
+    def test_move_page_translates_position(
+        self, pages_mixin, position, expected_api_position
+    ):
+        """before/after must map to the API's above/below tokens.
+
+        movepage.action knows only above/below/append. Regression: passing
+        'after' straight through made the endpoint silently no-op (200 OK,
+        page not moved).
+        """
+        # Arrange
+        pages_mixin.confluence.get_page_by_id.return_value = {"space": {"key": "TEST"}}
+
+        # Act
+        result = pages_mixin.move_page("111", "222", position=position)
+
+        # Assert
+        assert result is True
+        pages_mixin.confluence.move_page.assert_called_once_with(
+            space_key="TEST",
+            page_id="111",
+            target_id="222",
+            position=expected_api_position,
+        )
+
+    def test_move_page_invalid_position(self, pages_mixin):
+        """An unknown position is rejected instead of being passed through."""
+        with pytest.raises(Exception, match="Invalid move position"):
+            pages_mixin.move_page("111", "222", position="sideways")
+        pages_mixin.confluence.move_page.assert_not_called()
+
     def test_get_page_children_success(self, pages_mixin):
         """Test successfully getting child pages."""
         # Arrange

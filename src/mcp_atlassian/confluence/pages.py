@@ -539,6 +539,21 @@ class PagesMixin(ConfluenceClient):
         Raises:
             Exception: If there is an error moving the page
         """
+        # The movepage.action endpoint only understands 'above'/'below'/'append'
+        # ('topLevel' too) — NOT the intuitive 'before'/'after'. Passing an
+        # unknown value made the endpoint silently no-op (it returned 200 but
+        # left the page where it was), so 'after' never reordered anything.
+        # Keep the tool's before/after vocabulary and translate at the boundary.
+        api_position = {
+            "before": "above",
+            "after": "below",
+            "append": "append",
+        }.get(position)
+        if api_position is None:
+            raise Exception(
+                f"Invalid move position '{position}' (use before/after/append)."
+            )
+
         try:
             # Get target page to find its space key
             target_page = self.confluence.get_page_by_id(target_id, expand="space")
@@ -546,12 +561,14 @@ class PagesMixin(ConfluenceClient):
             if not space_key:
                 raise Exception(f"Could not determine space key for target page {target_id}")
 
-            logger.debug(f"Moving page {page_id} {position} {target_id} in space {space_key}")
+            logger.debug(
+                f"Moving page {page_id} {position}->{api_position} {target_id}"
+            )
             self.confluence.move_page(
                 space_key=space_key,
                 page_id=page_id,
                 target_id=target_id,
-                position=position,
+                position=api_position,
             )
             logger.info(f"Moved page {page_id} {position} {target_id}")
             return True
