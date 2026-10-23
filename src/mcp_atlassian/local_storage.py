@@ -14,6 +14,26 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
+# Confluence reads the closing tag of an explicitly closed void element as a
+# second element: every push of `<br></br>` stored two line breaks, so each
+# read/push round trip doubled them. They must stay self-closing.
+VOID_ELEMENTS = frozenset({
+    'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link',
+    'meta', 'source', 'track', 'wbr',
+})
+
+_EXPLICITLY_CLOSED_VOID = re.compile(
+    rf"<({'|'.join(sorted(VOID_ELEMENTS))})(\s[^<>]*?)?\s*/?>\s*</\1\s*>",
+    flags=re.IGNORECASE,
+)
+
+
+def close_void_elements(html_content: str) -> str:
+    """Rewrite `<br></br>` (and other void elements) to `<br />`."""
+    return _EXPLICITLY_CLOSED_VOID.sub(
+        lambda m: f"<{m.group(1)}{m.group(2) or ''} />", html_content
+    )
+
 
 def sanitize_filename(title: str, max_length: int = 100) -> str:
     """Sanitize a page title for use as a filename.
@@ -258,6 +278,11 @@ def _prettify_element(element, indent_level: int = 0) -> str:
                     value = ' '.join(value)
                 attrs.append(f'{key}="{value}"')
             attrs_str = ' ' + ' '.join(attrs) if attrs else ''
+
+            if tag_name in VOID_ELEMENTS:
+                prefix = f"\n{indent}" if is_block else ""
+                result.append(f"{prefix}<{child.name}{attrs_str} />")
+                continue
 
             # Special handling for elements that need raw content preserved (code blocks)
             if tag_name in preserve_content_elements:

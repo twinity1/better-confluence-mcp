@@ -13,6 +13,7 @@ from pydantic import Field
 from mcp_atlassian.local_storage import (
     SpaceMetadata,
     check_and_cleanup_moved_page,
+    close_void_elements,
     fix_html_spacing,
     get_page_info,
     load_space_metadata,
@@ -680,6 +681,8 @@ async def push_page_update(
 
             # Fix spacing around inline tags (agents often write without proper spacing)
             content = fix_html_spacing(content)
+            # Files synced before the void-element fix still hold `<br></br>`
+            content = close_void_elements(content)
 
             # Update page in Confluence
             updated_page = confluence_fetcher.update_page(
